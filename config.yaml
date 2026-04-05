@@ -1,0 +1,48 @@
+map:
+  width: 1000
+  height: 1000
+  center: [0, 0, 0]
+  # TODO: 添加边界定义和障碍物
+
+radar:
+  range: 500
+  pulse_interval: 1.0
+  delay: 0.5
+  # TODO: 添加噪声和精度参数
+
+base:
+  health: 100
+  position: [0, 0, 0]
+  # TODO: 实现基地站机制
+
+simulation:
+  fps: 30
+  duration: 60
+  # TODO: 添加暂停/恢复控制和保存/加载状态
+
+drones:
+  attack:
+    speed: 7.5
+    max_speed: 30.0
+    health: 80.0
+    attack_power: 25.0
+    battery: 80.0
+  tank:
+    speed: 4.5
+    max_speed: 20.0
+    health: 150.0
+    attack_power: 15.0
+    battery: 120.0
+  scout:
+    speed: 15.0
+    max_speed: 40.0
+    health: 60.0
+    attack_power: 5.0
+    battery: 60.0
+  interceptor:
+    speed: 12.0
+    max_speed: 35.0
+    health: 90.0
+    attack_power: 20.0
+    battery: 90.0
+

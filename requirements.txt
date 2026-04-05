@@ -1,0 +1,4 @@
+open3d>=0.17.2
+numpy>=1.25
+pyyaml>=6.0
+matplotlib>=3.8
