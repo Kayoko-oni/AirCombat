@@ -38,14 +38,13 @@ class BaseDrone:
     death_effect_duration: float = 1.5
 
     def update_position(self, delta_time: float) -> None:
-        """
-        根据当前速度更新位置
-        如果无人机被判定坠毁, 那么直接return, 不再继续调用此函数更新位置
-        如果无人机被判定存活, 那么实现 new_position = old_position + velocity * delta_time
-                            实现方式: zip(...), 将里面的两个列表, 每次各取出一个元素, 分别赋值给p和v, 每次循环计算 p + v * delta_time, 作为一个新的列表元素赋值给 self.position
-        将当前位置副本添加至轨迹列表 避免后续修改是position时影响到现有的点
-        当轨迹点列表的元素数量超过40个时 自动移除最旧的一个列表元素 实现列表的更新
-        """
+        """根据当前速度更新位置"""
+        #如果无人机被判定坠毁, 那么直接return, 不再继续调用此函数更新位置
+        #如果无人机被判定存活, 那么实现 new_position = old_position + velocity * delta_time
+                            #实现方式: zip(...), 将里面的两个列表, 每次各取出一个元素, 分别赋值给p和v, 每次循环计算 p + v * delta_time, 作为一个新的列表元素赋值给 self.position
+        #将当前位置副本添加至轨迹列表 避免后续修改是position时影响到现有的点
+        #当轨迹点列表的元素数量超过40个时 自动移除最旧的一个列表元素 实现列表的更新
+
         if self.destroyed:
             return
         self.position = [p + v * delta_time for p, v in zip(self.position, self.velocity)]
@@ -57,22 +56,21 @@ class BaseDrone:
     def set_velocity(self, velocity: List[float]) -> None:
         """
         设置速度向量，自动限制在最大速度内
-        此处限制速度的逻辑是: xyz三个方向上的速度分别不超过最大值, 这个逻辑可能有些问题，讨论过后可以更改
         """
+        #此处限制速度的逻辑是: xyz三个方向上的速度分别不超过最大值, 这个逻辑可能有些问题，讨论过后可以更改
         self.velocity = [max(min(v, self.max_speed), -self.max_speed) for v in velocity]
 
     def apply_damage(self, amount: float) -> None:
-        """
-        无人机碰撞后的生命值削减/坠毁判定程序
-        如果无人机已经坠毁(self.destroyed返回初始值True, 那么不重复执行坠毁程序)
-        执行生命值削减, 生命值变为 min(0.0, 血量-造成的伤害(对方基础伤害*相对速度)), 因为血量不小于0
-        如果无人机生命值归零, 那么执行坠毁程序
-            修改destroyed状态为True
-            将无人机速度判定为0
-            将无人机z坐标直接设定为0 (可能不是很合适, 讨论过后决定是否修改)
-            将坠毁计时初始化为0, 供爆炸动画使用
-            清除轨迹列表
-        """
+        """无人机碰撞后的坠毁判定程序, 传入此次碰撞受到的伤害"""
+        #如果无人机已经坠毁(self.destroyed返回初始值True, 那么不重复执行坠毁程序)
+        #执行生命值削减, 生命值变为 min(0.0, 血量-造成的伤害(对方基础伤害*相对速度)), 因为血量不小于0
+        #如果无人机生命值归零, 那么执行坠毁程序
+        #   修改destroyed状态为True
+        #    将无人机速度判定为0
+        #   将无人机z坐标直接设定为0 (可能不是很合适, 讨论过后决定是否修改)
+        #   将坠毁计时初始化为0, 供爆炸动画使用
+        #    清除轨迹列表
+        
         if self.destroyed:
             return
         self.health = max(0.0, self.health - amount)
@@ -93,9 +91,9 @@ class BaseDrone:
     def should_remove(self) -> bool:
         """
         判断坠毁后的无人机是否已经可以从场地中清除
-        当同时满足以下两个条件时, 认为无人机可以被清除
-            无人机坠毁( self.destroy == True)
-            坠毁计时 >= 坠毁爆炸特效所需时间 (坠毁爆炸特效已经完成)
+        当同时满足以下两个条件时, 认为无人机可以被清除 
+            1.无人机坠毁( self.destroy == True) 
+            2. 坠毁计时 >= 坠毁爆炸特效所需时间 (坠毁爆炸特效已经完成) 
         """
         return self.destroyed and self.death_timer >= self.death_effect_duration
 

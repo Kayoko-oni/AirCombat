@@ -6,27 +6,26 @@ from utils.geometry import clamp_position
 
 
 def move_drone(drone: BaseDrone, delta_time: float) -> None:
-    """ 参数为一个无人机对象以及delta_time步长, 直接修改无人机对象, 不返回值 """
+    """ 对目标无人机进行移动, 参数为一个无人机对象以及delta_time步长, 直接修改无人机对象, 不返回值 """
     if not drone.is_alive():
         return
     drone.update_position(delta_time)
     drone.position = clamp_position(drone.position, (-500, -500, -100), (500, 500, 100))
     # TODO: 使边界限制可配置而非硬编码
-    """
-    移动目标无人机
-    若此函数调用的无人机对象已经坠毁, 则不调用此函数, 直接return
-    调用drones —— base_drone —— update_position 函数, 更新无人机的位置
-    将无人机的位置设定在一定范围内: x[-500, 500] y[-500, 500] z[-100, 100]
-        但是由于之后要加载地图, 所以z的范围如果在0到100之间可能会更加合理, 可以导入地图过后再做更改
-    """
+    
+    #移动目标无人机
+    #若此函数调用的无人机对象已经坠毁, 则不调用此函数, 直接return
+    #调用drones —— base_drone —— update_position 函数, 更新无人机的位置
+    #将无人机的位置设定在一定范围内: x[-500, 500] y[-500, 500] z[-100, 100]
+     #   但是由于之后要加载地图, 所以z的范围如果在0到100之间可能会更加合理, 可以导入地图过后再做更改
+    
 
 
 def set_speed(drone: BaseDrone, velocity: Tuple[float, float, float]) -> None:
+    """ 设置无人机的数量, 传入要操作的无人机实例, 以及要设置的速度向量列表 """
     drone.set_velocity(list(velocity))
-    """
-    设置目标无人机的速度向量
-    调用目标无人机的成员函数.set_velocity
-    """
+    #设置目标无人机的速度向量
+    #调用目标无人机的成员函数.set_velocity
 
 
 def chase_target(drone: BaseDrone, target: BaseDrone) -> None:
