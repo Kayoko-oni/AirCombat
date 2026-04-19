@@ -30,6 +30,8 @@ def load_config(path: Path) -> dict:
     """加载 YAML 配置文件"""
     with path.open("r", encoding="utf-8") as handle:
         return yaml.safe_load(handle)
+
+#==============================无人机生成函数================================
     
 def create_attack_drone(name: str, position: list, config: dict, drones: list) -> None:
     """创建一架攻击机并直接加入 drones 列表, 参数为: name 位置坐标列表 config 要添加到的目标无人机列表(总列表为drones) """
@@ -51,15 +53,7 @@ def create_interceptor_drone(name: str, position: list, config: dict, drones: li
     drone = InterceptorDrone(name=name, position=position, config=config["drones"]["interceptor"])
     drones.append(drone)
 
-
-def create_drone_team(config: dict, drones: list = None) -> list:
-    """创建初始四架无人机，返回无人机列表"""
-    drones = []  #新建一个无人机空列表
-    create_attack_drone("Attack-01", [-100, -50, 20], config, drones)
-    create_tank_drone("Tank-01", [-120, -50, -20], config, drones)
-    create_scout_drone("Scout-01", [100, 50, 30], config, drones)
-    create_interceptor_drone("Intercepter-01", [120, 50, -30], config, drones)
-    return drones  #返回此列表作为无人机初始团队
+#===========================================================================
 
 
 def _is_offensive(drone):
@@ -107,30 +101,53 @@ def update_chase_strategy(drones):
     #如果确认该目标存活, 则调用Controller——single_control——chase_target函数, 使其向目标无人机的位置运动
 
 
+#=================暂行无人机生成策略，之后要被任务分配算法替代============================================
+
+def create_drone_team(config: dict, drones: list = None) -> list:
+    """创建初始四架无人机，返回无人机列表"""
+    drones = []  #新建一个无人机空列表
+    create_attack_drone("Attack-01", [-100, -50, 20], config, drones)
+    create_tank_drone("Tank-01", [-120, -50, 40], config, drones)
+    create_scout_drone("Scout-01", [100, 50, 30], config, drones)
+    create_interceptor_drone("Intercepter-01", [120, 50, 50], config, drones)
+    return drones  #返回此列表作为无人机初始团队
 
 def spawn_random_drone(config: dict, drones: list) -> None:
-    """ 场上无人机总数小于14时, 随机生成类型随机的无人机, 进攻方生成在x负半轴, 防守方生成在x正半轴 """
+    """ 场上进攻方数量小于7时, 随机生成类型随机的进攻无人机, 生成范围为地图的上界平面 """
     active = [d for d in drones if not d.destroyed]
     if len(active) >= 14:
         return
     for _ in range(random.randint(1, 2)):
-        drone_type = random.choice(["attack", "tank", "scout", "interceptor"])
+        drone_type = random.choice(["attack", "tank"])
         if drone_type in {"attack", "tank"}:
-            position = [random.uniform(-450, -250), random.uniform(-400, 400), random.uniform(-20, 40)]
-        else:
-            position = [random.uniform(250, 450), random.uniform(-400, 400), random.uniform(-20, 40)]
+            position = [random.uniform(-450, -250), random.uniform(-400, 400), 100]
         name = f"{drone_type.capitalize()}-{random.randint(100,999)}"
-        
         # 调用对应的生成函数，它们内部会执行 drones.append(drone)
         if drone_type == "attack":
             create_attack_drone(name, position, config, drones)
         elif drone_type == "tank":
             create_tank_drone(name, position, config, drones)
-        elif drone_type == "scout":
+        # 注意：这里不需要再手动 drones.append()
+
+def balance_defenders(config: dict, drones: list) -> None:
+    """立即平衡防守方数量，直到防守方数量 >= 进攻方数量"""
+    offensive = [d for d in drones if _is_offensive(d) and d.is_alive()]
+    defensive = [d for d in drones if not _is_offensive(d) and d.is_alive()]
+    # 计算需要补充的防守方数量
+    need = len(offensive) - len(defensive)
+    if need <= 0:
+        return  #如果防守方数量大于进攻方，则直接返回
+    # 一次性生成 need 架防守方（固定在基地）
+    for _ in range(need):
+        drone_type = random.choice(["scout", "interceptor"])
+        position = [0.0, 0.0, 0.0]
+        name = f"{drone_type.capitalize()}-{random.randint(100,999)}"
+        if drone_type == "scout":
             create_scout_drone(name, position, config, drones)
         else:
             create_interceptor_drone(name, position, config, drones)
-        # 注意：这里不需要再手动 drones.append()
+
+#==================================================================================================
 
 
 def run_simulation(config: dict):
@@ -155,12 +172,14 @@ def run_simulation(config: dict):
     duration = config["simulation"]["duration"]
     next_spawn_time = random.uniform(1.0, 3.0)
     spawn_timer = 0.0
+
     #将帧率fps的值设置为配置中simulation-fps的值
     #frame_time 为一帧所持续的时间
     #start_time 仿真开始的时间, 设置为从time.time()中获取的系统绝对时间
     #duration 仿真的持续时间, 从配置中的simulation-duration中获取
     #下一次无人机生成的时间, 在 1~3 之间生成一个随机数 (这里之后肯定是要改掉的)
-    #无人机生成时间的计时器初始化为0, 其值随着时间的进行同步增加, 当其大于next_spawn_time时生成新无人机(之后肯定要改掉的)
+    #进攻无人机生成时间的计时器初始化为0, 其值随着时间的进行同步增加, 当其大于next_spawn_time时生成新无人机(之后肯定要改掉的)
+
 
     try:
         while time.time() - start_time < duration:
@@ -191,12 +210,14 @@ def run_simulation(config: dict):
                 move_drone(drone, frame_time)
             #对在alive_drone列表中(也就是确认存活的)无人机, 执行位置更新操作"""
 
-            spawn_timer += frame_time
+            spawn_timer += frame_time  #随机生成进攻方无人机
             if spawn_timer >= next_spawn_time:
                 spawn_timer = 0.0
                 next_spawn_time = random.uniform(1.0, 3.0)
                 if random.random() < 0.9:
                     spawn_random_drone(config, drones)
+
+            balance_defenders(config, drones) #根据进攻方无人机数量补充防守方无人机
 
             detections = radar.scan(alive_drones)
             #雷达扫描一次所有存活的无人机 """

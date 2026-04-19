@@ -10,7 +10,7 @@ def move_drone(drone: BaseDrone, delta_time: float) -> None:
     if not drone.is_alive():
         return
     drone.update_position(delta_time)
-    drone.position = clamp_position(drone.position, (-500, -500, -100), (500, 500, 100))
+    drone.position = clamp_position(drone.position, (-500, -500, 0), (500, 500, 100))
     # TODO: 使边界限制可配置而非硬编码
     
     #移动目标无人机
@@ -39,12 +39,10 @@ def chase_target(drone: BaseDrone, target: BaseDrone) -> None:
     normalized = [v / distance for v in direction]
     velocity = [normalized[i] * drone.max_speed for i in range(3)]
     drone.set_velocity(velocity)
-    """
-    如果追踪方与被追踪方 有一方已经坠毁, 则直接返回, 不进行追踪
-    计算追踪方位置指向被追踪方位置的方向向量direction
-    计算direction的模长, 即为二者之间的距离distance
-    如果距离小于0.01, 则直接返回
-    将方向向量direction除以距离distance, 完成归一化, 得到归一化的单位方向向量normalized
-    将单位方向向量normalized乘上无人机的最大速度.max_speed, 得到无人机的最大速度向量velocity
-    将无人机的速度设置为最大速度向量velocity, 无人机将沿着这个速度向量的方向运动
-    """
+    #如果追踪方与被追踪方 有一方已经坠毁, 则直接返回, 不进行追踪
+    #计算追踪方位置指向被追踪方位置的方向向量direction
+    #计算direction的模长, 即为二者之间的距离distance
+    #如果距离小于0.01, 则直接返回
+    #将方向向量direction除以距离distance, 完成归一化, 得到归一化的单位方向向量normalized
+    #将单位方向向量normalized乘上无人机的最大速度.max_speed, 得到无人机的最大速度向量velocity
+    #将无人机的速度设置为最大速度向量velocity, 无人机将沿着这个速度向量的方向运动
