@@ -1,5 +1,6 @@
 import math
 from typing import Tuple
+from typing import List
 
 from drones.base_drone import BaseDrone
 from utils.geometry import clamp_position
@@ -29,7 +30,7 @@ def set_speed(drone: BaseDrone, velocity: Tuple[float, float, float]) -> None:
 
 
 def chase_target(drone: BaseDrone, target: BaseDrone) -> None:
-    """让无人机朝向目标无人机的位置追踪。"""
+    """让无人机朝向目标无人机的位置追踪。参数：要操控的无人机实例 想要追踪的无人机实例"""
     if not drone.is_alive() or not target.is_alive():
         return
     direction = [t - p for t, p in zip(target.position, drone.position)]
@@ -46,3 +47,15 @@ def chase_target(drone: BaseDrone, target: BaseDrone) -> None:
     #将方向向量direction除以距离distance, 完成归一化, 得到归一化的单位方向向量normalized
     #将单位方向向量normalized乘上无人机的最大速度.max_speed, 得到无人机的最大速度向量velocity
     #将无人机的速度设置为最大速度向量velocity, 无人机将沿着这个速度向量的方向运动
+
+def chase_point(drone: BaseDrone, target_point: List[float]) -> None:
+    """让无人机朝向固定点追踪。参数：要操控的无人机实例 目标点的坐标列表 """
+    if not drone.is_alive():
+        return
+    direction = [t - p for t, p in zip(target_point, drone.position)]
+    distance = math.sqrt(sum(v * v for v in direction)) 
+    if distance < 1e-3:
+        return
+    normalized = [v / distance for v in direction]
+    velocity = [normalized[i] * drone.max_speed for i in range(3)]
+    drone.set_velocity(velocity)

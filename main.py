@@ -9,7 +9,7 @@ from drones.offensive.attack_drone import AttackDrone
 from drones.offensive.tank_drone import TankDrone
 from drones.defensive.scout_drone import ScoutDrone
 from drones.defensive.interceptor_drone import InterceptorDrone
-from Controller.single_control import chase_target, move_drone
+from Controller.single_control import chase_target, chase_point, move_drone
 from sensing.radar import RadarSensor
 from utils.logger import get_logger
 
@@ -87,10 +87,8 @@ def update_chase_strategy(drones):
     defensive = [d for d in drones if not _is_offensive(d) and d.is_alive()]
     #先将无人机列表中的所有实例遍历, 将它们分为offensive和defensive两个列表
     for drone in offensive:
-        target = _find_nearest_opponent(drone, defensive)
-        if target is not None:
-            chase_target(drone, target)
-    #遍历进攻方无人机列表, 将每个无人机的目标设置为距离自己最近的敌机,
+        chase_point(drone, [0.0, 0.0, 0.0])
+    #遍历进攻方无人机列表, 将每个无人机的目标设置为地图原点（基地）,
     #如果确认该目标存活, 则调用Controller——single_control——chase_target函数, 使其向目标无人机的位置运动
 
     for drone in defensive:
