@@ -30,16 +30,36 @@ def load_config(path: Path) -> dict:
     """加载 YAML 配置文件"""
     with path.open("r", encoding="utf-8") as handle:
         return yaml.safe_load(handle)
+    
+def create_attack_drone(name: str, position: list, config: dict, drones: list) -> None:
+    """创建一架攻击机并直接加入 drones 列表, 参数为: name 位置坐标列表 config 要添加到的目标无人机列表(总列表为drones) """
+    drone = AttackDrone(name=name, position=position, config=config["drones"]["attack"])
+    drones.append(drone)
+
+def create_tank_drone(name: str, position: list, config: dict, drones: list) -> None:
+    """创建一架肉盾机并直接加入 drones 列表, 参数为: name 位置坐标列表 config 要添加到的目标无人机列表(总列表为drones) """
+    drone = TankDrone(name=name, position=position, config=config["drones"]["tank"])
+    drones.append(drone)
+
+def create_scout_drone(name: str, position: list, config: dict, drones: list) -> None:
+    """创建一架侦察机并直接加入 drones 列表, 参数为: name 位置坐标列表 config 要添加到的目标无人机列表(总列表为drones) """
+    drone = ScoutDrone(name=name, position=position, config=config["drones"]["scout"])
+    drones.append(drone)
+
+def create_interceptor_drone(name: str, position: list, config: dict, drones: list) -> None:
+    """创建一架拦截机并直接加入 drones 列表, 参数为: name 位置坐标列表 config 要添加到的目标无人机列表(总列表为drones) """
+    drone = InterceptorDrone(name=name, position=position, config=config["drones"]["interceptor"])
+    drones.append(drone)
 
 
-def create_drone_team(config: dict) -> list:
-    """根据配置创建无人机团队"""
-    return [
-        AttackDrone(name="Attack-01", position=[-100, -50, 20], config=config["drones"]["attack"]),
-        TankDrone(name="Tank-01", position=[-120, -50, -20], config=config["drones"]["tank"]),
-        ScoutDrone(name="Scout-01", position=[100, 50, 30], config=config["drones"]["scout"]),
-        InterceptorDrone(name="Intercepter-01", position=[120, 50, -30], config=config["drones"]["interceptor"]),
-    ]
+def create_drone_team(config: dict, drones: list = None) -> list:
+    """创建初始四架无人机，返回无人机列表"""
+    drones = []  #新建一个无人机空列表
+    create_attack_drone("Attack-01", [-100, -50, 20], config, drones)
+    create_tank_drone("Tank-01", [-120, -50, -20], config, drones)
+    create_scout_drone("Scout-01", [100, 50, 30], config, drones)
+    create_interceptor_drone("Intercepter-01", [120, 50, -30], config, drones)
+    return drones  #返回此列表作为无人机初始团队
 
 
 def _is_offensive(drone):
@@ -89,27 +109,28 @@ def update_chase_strategy(drones):
 
 
 def spawn_random_drone(config: dict, drones: list) -> None:
-    """ 随机生成无人机, 保持场上无人机数量在14架以内, 防守方生成在右侧, 进攻方生成在左侧, 之后会被任务分配算法替换"""
-    active = [drone for drone in drones if not drone.destroyed]
+    """ 场上无人机总数小于14时, 随机生成类型随机的无人机, 进攻方生成在x负半轴, 防守方生成在x正半轴 """
+    active = [d for d in drones if not d.destroyed]
     if len(active) >= 14:
         return
     for _ in range(random.randint(1, 2)):
         drone_type = random.choice(["attack", "tank", "scout", "interceptor"])
-        config_key = drone_type
         if drone_type in {"attack", "tank"}:
             position = [random.uniform(-450, -250), random.uniform(-400, 400), random.uniform(-20, 40)]
         else:
             position = [random.uniform(250, 450), random.uniform(-400, 400), random.uniform(-20, 40)]
-        # TODO: 使生成位置可配置而非硬编码
+        name = f"{drone_type.capitalize()}-{random.randint(100,999)}"
+        
+        # 调用对应的生成函数，它们内部会执行 drones.append(drone)
         if drone_type == "attack":
-            drone = AttackDrone(name=f"Attack-{random.randint(100,999)}", position=position, config=config["drones"][config_key])
+            create_attack_drone(name, position, config, drones)
         elif drone_type == "tank":
-            drone = TankDrone(name=f"Tank-{random.randint(100,999)}", position=position, config=config["drones"][config_key])
+            create_tank_drone(name, position, config, drones)
         elif drone_type == "scout":
-            drone = ScoutDrone(name=f"Scout-{random.randint(100,999)}", position=position, config=config["drones"][config_key])
+            create_scout_drone(name, position, config, drones)
         else:
-            drone = InterceptorDrone(name=f"Intercepter-{random.randint(100,999)}", position=position, config=config["drones"][config_key])
-        drones.append(drone)
+            create_interceptor_drone(name, position, config, drones)
+        # 注意：这里不需要再手动 drones.append()
 
 
 def run_simulation(config: dict):
