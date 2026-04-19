@@ -9,6 +9,7 @@ from drones.offensive.attack_drone import AttackDrone
 from drones.offensive.tank_drone import TankDrone
 from drones.defensive.scout_drone import ScoutDrone
 from drones.defensive.interceptor_drone import InterceptorDrone
+from drones.factory import create_drone_team, create_attack_drone, create_tank_drone, create_interceptor_drone, create_scout_drone
 from Controller.single_control import chase_target, chase_point, move_drone
 from sensing.radar import RadarSensor
 from utils.logger import get_logger
@@ -30,30 +31,6 @@ def load_config(path: Path) -> dict:
     """加载 YAML 配置文件"""
     with path.open("r", encoding="utf-8") as handle:
         return yaml.safe_load(handle)
-
-#==============================无人机生成函数================================
-    
-def create_attack_drone(name: str, position: list, config: dict, drones: list) -> None:
-    """创建一架攻击机并直接加入 drones 列表, 参数为: name 位置坐标列表 config 要添加到的目标无人机列表(总列表为drones) """
-    drone = AttackDrone(name=name, position=position, config=config["drones"]["attack"])
-    drones.append(drone)
-
-def create_tank_drone(name: str, position: list, config: dict, drones: list) -> None:
-    """创建一架肉盾机并直接加入 drones 列表, 参数为: name 位置坐标列表 config 要添加到的目标无人机列表(总列表为drones) """
-    drone = TankDrone(name=name, position=position, config=config["drones"]["tank"])
-    drones.append(drone)
-
-def create_scout_drone(name: str, position: list, config: dict, drones: list) -> None:
-    """创建一架侦察机并直接加入 drones 列表, 参数为: name 位置坐标列表 config 要添加到的目标无人机列表(总列表为drones) """
-    drone = ScoutDrone(name=name, position=position, config=config["drones"]["scout"])
-    drones.append(drone)
-
-def create_interceptor_drone(name: str, position: list, config: dict, drones: list) -> None:
-    """创建一架拦截机并直接加入 drones 列表, 参数为: name 位置坐标列表 config 要添加到的目标无人机列表(总列表为drones) """
-    drone = InterceptorDrone(name=name, position=position, config=config["drones"]["interceptor"])
-    drones.append(drone)
-
-#===========================================================================
 
 
 def _is_offensive(drone):
@@ -100,15 +77,6 @@ def update_chase_strategy(drones):
 
 
 #=================暂行无人机生成策略，之后要被任务分配算法替代============================================
-
-def create_drone_team(config: dict, drones: list = None) -> list:
-    """创建初始四架无人机，返回无人机列表"""
-    drones = []  #新建一个无人机空列表
-    create_attack_drone("Attack-01", [-100, -50, 20], config, drones)
-    create_tank_drone("Tank-01", [-120, -50, 40], config, drones)
-    create_scout_drone("Scout-01", [100, 50, 30], config, drones)
-    create_interceptor_drone("Intercepter-01", [120, 50, 50], config, drones)
-    return drones  #返回此列表作为无人机初始团队
 
 def spawn_random_drone(config: dict, drones: list) -> None:
     """ 场上进攻方数量小于7时, 随机生成类型随机的进攻无人机, 生成范围为地图的上界平面 """
