@@ -68,12 +68,23 @@ def update_chase_strategy(drones):
     #遍历进攻方无人机列表, 将每个无人机的目标设置为地图原点（基地）,
     #如果确认该目标存活, 则调用Controller——single_control——chase_target函数, 使其向目标无人机的位置运动
 
-    for drone in defensive:
-        target = _find_nearest_opponent(drone, offensive)
-        if target is not None:
-            chase_target(drone, target)
-    #遍历防守方无人机列表, 将每个无人机的目标设置为距离自己最近的敌机,
-    #如果确认该目标存活, 则调用Controller——single_control——chase_target函数, 使其向目标无人机的位置运动
+    if offensive and defensive:
+        from algorithms.auction_assign import greedy_assignment
+        assignment = greedy_assignment(defensive, offensive)  # 键是名字字符串
+        # 构建名字到防守方对象的映射
+        name_to_defender = {d.name: d for d in defensive}
+        for def_name, target in assignment.items():
+            defender = name_to_defender.get(def_name)
+            if defender is None:
+                continue
+            if target is not None:
+                chase_target(defender, target)
+            else:
+                defender.set_velocity([0.0, 0.0, 0.0])
+    elif defensive:
+        # 没有进攻方时，防守方停止移动
+        for defender in defensive:
+            defender.set_velocity([0.0, 0.0, 0.0])
 
 
 #=================暂行无人机生成策略，之后要被任务分配算法替代============================================
