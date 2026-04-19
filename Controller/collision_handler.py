@@ -3,7 +3,6 @@ from typing import List, Tuple
 from drones.base_drone import BaseDrone
 from utils.geometry import distance
 
-
 def detect_collisions(drones: List[BaseDrone], min_distance: float = 8.0) -> List[Tuple[BaseDrone, BaseDrone]]:
     """
     无人机碰撞检测
@@ -18,14 +17,17 @@ def detect_collisions(drones: List[BaseDrone], min_distance: float = 8.0) -> Lis
         for j in range(i + 1, len(drones)):
             if not drones[i].is_alive() or not drones[j].is_alive():
                 continue
+            
+            # 新增：判断是否同一阵营
+            # 进攻方: AttackDrone 或 TankDrone
+            # 防守方: ScoutDrone 或 InterceptorDrone
+            is_offensive_i = drones[i].drone_type in {"AttackDrone", "TankDrone"}
+            is_offensive_j = drones[j].drone_type in {"AttackDrone", "TankDrone"}
+            if is_offensive_i == is_offensive_j:
+                continue  # 同一阵营，跳过碰撞检测
+            
             if distance(drones[i].position, drones[j].position) < min_distance:
                 collisions.append((drones[i], drones[j]))
-    #新建一个命名为collisions的空列表
-    #枚举所有无人机的两两组合
-     #   若两架无人机有一架已经坠毁, 则continue跳过本次循环, 实现: 已经坠毁的无人机不参与碰撞检测
-      #  若两架无人机都存活, 且它们的距离小于碰撞阈值距离, 则认为它们发生了碰撞, 将它们添加到collision碰撞列表中
-    #返回碰撞列表
-    
     return collisions
 
 
