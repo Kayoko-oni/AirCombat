@@ -90,14 +90,14 @@ def update_chase_strategy(drones):
 #=================暂行无人机生成策略，之后要被任务分配算法替代============================================
 
 def spawn_random_drone(config: dict, drones: list) -> None:
-    """ 场上进攻方数量小于7时, 随机生成类型随机的进攻无人机, 生成范围为地图的上界平面 """
-    active = [d for d in drones if not d.destroyed]
-    if len(active) >= 14:
+    #根据当前进攻方无人机数量随机生成1~2架新的进攻方无人机, 生成位置在地图左侧(-450~450, -400~400, 100), 类型随机为attack或tank
+    offensive = [d for d in drones if _is_offensive(d) and d.is_alive()]
+    if len(offensive) >= 10:
         return
     for _ in range(random.randint(1, 2)):
         drone_type = random.choice(["attack", "tank"])
         if drone_type in {"attack", "tank"}:
-            position = [random.uniform(-450, -250), random.uniform(-400, 400), 100]
+            position = [random.uniform(-450, 450), random.uniform(-400, 400), 100]
         name = f"{drone_type.capitalize()}-{random.randint(100,999)}"
         # 调用对应的生成函数，它们内部会执行 drones.append(drone)
         if drone_type == "attack":
@@ -194,7 +194,9 @@ def run_simulation(config: dict):
                 if random.random() < 0.9:
                     spawn_random_drone(config, drones)
 
-            balance_defenders(config, drones) #根据进攻方无人机数量补充防守方无人机
+            
+            balance_defenders(config, drones) #每帧立即平衡防守方数量, 直到防守方数量 >= 进攻方数量"""
+            
 
             detections = radar.scan(alive_drones)
             #雷达扫描一次所有存活的无人机 """
