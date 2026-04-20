@@ -17,7 +17,8 @@ base:
 
 simulation:
   fps: 30
-  duration: 60
+  duration: 0
+  # 0 表示无限运行时间，直到手动关闭程序
   # TODO: 添加暂停/恢复控制和保存/加载状态
 
 drones:

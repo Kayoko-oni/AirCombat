@@ -34,8 +34,12 @@ class BaseDrone:
     max_speed: float = 20.0
     trail: List[List[float]] = field(default_factory=list)
     destroyed: bool = False
+    falling: bool = False
+    impact: bool = False
     death_timer: float = 0.0
     death_effect_duration: float = 1.5
+    ground_height: float = 0.0
+    gravity: float = 9.8
 
     def update_position(self, delta_time: float) -> None:
         """根据当前速度更新位置"""
@@ -52,6 +56,21 @@ class BaseDrone:
         if len(self.trail) > 40:
             self.trail.pop(0)
         # TODO: 优化轨迹存储，或许使用deque以提高性能
+
+    def update_fall(self, delta_time: float) -> None:
+        """坠毁后在重力作用下下落，直到撞击地面。"""
+        if not self.destroyed or self.impact:
+            return
+        self.velocity[2] -= self.gravity * delta_time
+        self.position[2] += self.velocity[2] * delta_time
+        self.trail.append(self.position.copy())
+        if len(self.trail) > 40:
+            self.trail.pop(0)
+        if self.position[2] <= self.ground_height:
+            self.position[2] = self.ground_height
+            self.falling = False
+            self.impact = True
+            self.death_timer = 0.0
 
     def set_velocity(self, velocity: List[float]) -> None:
         """
@@ -76,16 +95,18 @@ class BaseDrone:
         self.health = max(0.0, self.health - amount)
         if self.health <= 0.0:
             self.destroyed = True
-            self.velocity = [0.0, 0.0, 0.0]
-            self.position[2] = 0.0
+            self.falling = True
+            self.impact = False
+            previous_velocity = self.velocity.copy()
+            self.velocity = [v * 0.5 for v in previous_velocity]
             self.death_timer = 0.0
             self.trail.clear()
 
     def update_death_timer(self, delta_time: float) -> None:
         """
-        无人机坠毁后, 对坠毁计时进行更新, 每帧的坠毁计时更新为+= delta_time
+        无人机坠毁后, 在撞击地面并产生爆炸效果时，累积定时器
         """
-        if self.destroyed:
+        if self.destroyed and self.impact:
             self.death_timer += delta_time
 
     def should_remove(self) -> bool:

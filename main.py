@@ -159,8 +159,8 @@ def run_simulation(config: dict):
 
 
     try:
-        while time.time() - start_time < duration:
-            #当仿真时间小于duration时, 继续进行仿真的新一帧 """
+        while duration <= 0 or time.time() - start_time < duration:
+            # 当 duration<=0 时表示无限运行，否则按配置时长运行
             update_chase_strategy(drones)
             # 更新每架无人机的追逐策略 """
             collisions = detect_collisions(drones)
@@ -171,7 +171,10 @@ def run_simulation(config: dict):
 
             for drone in drones:
                 if drone.destroyed:
-                    drone.update_death_timer(frame_time)
+                    if drone.falling:
+                        drone.update_fall(frame_time)
+                    elif drone.impact:
+                        drone.update_death_timer(frame_time)
             #执行完碰撞处理函数后, 遍历所有无人机, 判断它们是否坠毁"""
 
             drones = [d for d in drones if not d.should_remove()]

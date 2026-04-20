@@ -63,6 +63,20 @@ class Open3DDisplay:
         coord_frame = self.o3d.geometry.TriangleMesh.create_coordinate_frame(size=20.0)
         coord_frame.compute_vertex_normals()
         self.scene_widget.scene.add_geometry("coord_frame", coord_frame, self.rendering.MaterialRecord())
+        self._add_ground_plane()
+
+    def _add_ground_plane(self):
+        ground = self.o3d.geometry.TriangleMesh.create_box(
+            width=self.map_size[0],
+            height=self.map_size[1],
+            depth=0.1,
+        )
+        ground.translate([-self.map_size[0] / 2, -self.map_size[1] / 2, -0.1])
+        ground.compute_vertex_normals()
+        ground.paint_uniform_color((0.92, 0.92, 0.92))
+        material = self.rendering.MaterialRecord()
+        material.base_color = (0.92, 0.92, 0.92, 0.95)
+        self.scene_widget.scene.add_geometry("ground_plane", ground, material)
 
     def _on_layout(self, layout_context):
         r = self.window.content_rect
@@ -111,21 +125,36 @@ class Open3DDisplay:
         
         # Clear previous geometries except coordinate frame
         self.scene_widget.scene.clear_geometry()
-        # Re-add coordinate frame
+        # Re-add coordinate frame and ground plane
         coord_frame = self.o3d.geometry.TriangleMesh.create_coordinate_frame(size=20.0)
         coord_frame.compute_vertex_normals()
         self.scene_widget.scene.add_geometry("coord_frame", coord_frame, self.rendering.MaterialRecord())
+        self._add_ground_plane()
 
         offensive = [d for d in drones if d.drone_type in {"AttackDrone", "TankDrone"} and not d.destroyed]
         defensive = [d for d in drones if d.drone_type not in {"AttackDrone", "TankDrone"} and not d.destroyed]
 
         for drone in drones:
             if drone.destroyed:
-                explosion_color = (1.0, 0.6, 0.0) if drone.drone_type in {"AttackDrone", "TankDrone"} else (0.0, 0.6, 1.0)
-                debris = create_explosion_mesh(drone.position, drone.death_timer, drone.death_effect_duration, color=explosion_color)
-                material = self.rendering.MaterialRecord()
-                material.base_color = explosion_color + (1.0,)
-                self.scene_widget.scene.add_geometry(f"explosion_{drone.name}", debris, material)
+                if drone.impact:
+                    explosion_color = (0.8, 0.2, 0.0) if drone.drone_type in {"AttackDrone", "TankDrone"} else (0.0, 0.2, 0.8)
+                    debris = create_explosion_mesh(drone.position, drone.death_timer, drone.death_effect_duration, color=explosion_color)
+                    material = self.rendering.MaterialRecord()
+                    material.base_color = explosion_color + (1.0,)
+                    self.scene_widget.scene.add_geometry(f"explosion_{drone.name}", debris, material)
+                else:
+                    fall_color = (0.6, 0.1, 0.1) if drone.drone_type in {"AttackDrone", "TankDrone"} else (0.1, 0.1, 0.6)
+                    mesh = create_drone_mesh(drone.position, color=fall_color)
+                    material = self.rendering.MaterialRecord()
+                    material.base_color = fall_color + (1.0,)
+                    self.scene_widget.scene.add_geometry(f"falling_{drone.name}", mesh, material)
+                    if len(drone.trail) > 1:
+                        path = create_path_line(drone.trail, color=fall_color)
+                        if path is not None:
+                            material_trail = self.rendering.MaterialRecord()
+                            material_trail.shader = 'unlitLine'
+                            material_trail.base_color = fall_color + (1.0,)
+                            self.scene_widget.scene.add_geometry(f"trail_{drone.name}", path, material_trail)
                 continue
 
             color = self._drone_color(drone)
