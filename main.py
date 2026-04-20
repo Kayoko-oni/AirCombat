@@ -161,41 +161,49 @@ def run_simulation(config: dict):
     try:
         while time.time() - start_time < duration:
             #当仿真时间小于duration时, 继续进行仿真的新一帧 """
-            update_chase_strategy(drones)
-            # 更新每架无人机的追逐策略 """
+
+            #1. 检测无人机电量
+            for drone in drones:
+                drone.update_battery(frame_time) #每帧更新无人机的电量状态, 包括电量耗尽的判定和处理"""
+
+            #2.检测是否发生了碰撞
             collisions = detect_collisions(drones)
-            # 收集这一帧中发生碰撞的无人机的列表"""
+            #如果在这一帧中发生了碰撞, 那么对发生碰撞的无人机对执行 Controller——collision_handler——resolve_collisions中的碰撞处理函数"""
             if collisions:
                 resolve_collisions(collisions)
-            #如果在这一帧中发生了碰撞, 那么对发生碰撞的无人机对执行 Controller——collision_handler——resolve_collisions中的碰撞处理函数"""
 
+            #3.增加坠毁无人机的死亡倒计时
             for drone in drones:
                 if drone.destroyed:
                     drone.update_death_timer(frame_time)
-            #执行完碰撞处理函数后, 遍历所有无人机, 判断它们是否坠毁"""
 
+            #4. 移除死亡倒计时结束的无人机，更新drones列表
             drones = [d for d in drones if not d.should_remove()]
-            #剔除drones列表中所有被 .should_move函数判断为"应该被移除"的无人机, 即更新drone列表"""
 
+            #5. 拉取存活无人机列表 （此时场地内仍有坠毁但死亡倒计时未结束的无人机）
             alive_drones = [d for d in drones if not d.destroyed]
             if not alive_drones:
+                #如果没有存活的无人机了, 则输出一条info等级的日志: 所有无人机已被摧毁, 仿真结束, 然后跳出循环结束仿真
                 LOGGER.info("All active drones destroyed, ending simulation.")
                 break
-            #将所有未被摧毁的无人机添加至alive_drone列表, 如果没有存活的无人机了, 输出到日志, 结束仿真"""
 
+            #6. 更新存活的无人机的追逐策略
+            update_chase_strategy(alive_drones)
+
+            #7. 移动存活的无人机
             for drone in alive_drones:
                 move_drone(drone, frame_time)
-            #对在alive_drone列表中(也就是确认存活的)无人机, 执行位置更新操作"""
 
-            spawn_timer += frame_time  #随机生成进攻方无人机
+            #8.随机生成进攻方无人机
+            spawn_timer += frame_time  
             if spawn_timer >= next_spawn_time:
                 spawn_timer = 0.0
                 next_spawn_time = random.uniform(1.0, 3.0)
                 if random.random() < 0.9:
                     spawn_random_drone(config, drones)
 
-            
-            balance_defenders(config, drones) #每帧立即平衡防守方数量, 直到防守方数量 >= 进攻方数量"""
+            #根据进攻方无人机数量平衡防守方数量
+            balance_defenders(config, drones) #直到防守方数量 >= 进攻方数量"""
             
 
             detections = radar.scan(alive_drones)

@@ -60,6 +60,23 @@ class BaseDrone:
         #此处限制速度的逻辑是: xyz三个方向上的速度分别不超过最大值, 这个逻辑可能有些问题，讨论过后可以更改
         self.velocity = [max(min(v, self.max_speed), -self.max_speed) for v in velocity]
 
+    def update_battery(self, delta_time: float) -> None:
+        """更新电量，每秒消耗 rate 点，耗尽则坠毁"""
+        if self.destroyed: #如果已经坠毁，则不再判定电量
+            return
+        # 消耗速率（点/秒），可以先硬编码 5
+        drain_rate = 5.0
+        #TODO：后续改为每种机型数据不同，并从字典中读取
+        self.battery -= drain_rate * delta_time
+        if self.battery <= 0.0:
+            self.battery = 0.0
+            # 电量耗尽，坠毁（复用死亡逻辑）
+            self.destroyed = True
+            self.velocity = [0.0, 0.0, 0.0]
+            self.position[2] = 0.0 # 电量耗尽的无人机直接坠地
+            self.death_timer = 0.0
+            self.trail.clear()
+
     def apply_damage(self, amount: float) -> None:
         """无人机碰撞后的坠毁判定程序, 传入此次碰撞受到的伤害"""
         #如果无人机已经坠毁(self.destroyed返回初始值True, 那么不重复执行坠毁程序)
