@@ -57,6 +57,18 @@ class BaseDrone:
             self.trail.pop(0)
         # TODO: 优化轨迹存储，或许使用deque以提高性能
 
+    def update_battery(self, delta_time: float, drain_rate: float = 5.0) -> None: #TODO；将电池消耗速率写入配置文件
+        """
+        更新电量，每秒消耗 drain_rate 点，耗尽则触发坠毁（复用 apply_damage 逻辑）。
+        """
+        if self.destroyed:
+            return
+        self.battery -= drain_rate * delta_time
+        if self.battery <= 0.0:
+            self.battery = 0.0
+            # 造成等同于当前血量的伤害，触发坠落/死亡流程
+            self.apply_damage(self.health)
+
     def update_fall(self, delta_time: float) -> None:
         """坠毁后在重力作用下下落，直到撞击地面。"""
         if not self.destroyed or self.impact:
@@ -89,7 +101,6 @@ class BaseDrone:
         #   将无人机z坐标直接设定为0 (可能不是很合适, 讨论过后决定是否修改)
         #   将坠毁计时初始化为0, 供爆炸动画使用
         #    清除轨迹列表
-        
         if self.destroyed:
             return
         self.health = max(0.0, self.health - amount)
