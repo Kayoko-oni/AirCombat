@@ -1,7 +1,7 @@
 from typing import List
 
 from drones.base_drone import BaseDrone
-from Visual.render_utils import create_drone_mesh, create_path_line, create_explosion_mesh
+from Visual.render_utils import create_drone_mesh, create_path_line, create_explosion_mesh, create_drone_model_mesh
 
 
 class Open3DDisplay:
@@ -158,7 +158,7 @@ class Open3DDisplay:
                 continue
 
             color = self._drone_color(drone)
-            mesh = create_drone_mesh(drone.position, color=color)
+            mesh = create_drone_model_mesh(drone.position, color=color)
             material = self.rendering.MaterialRecord()
             material.base_color = color + (1.0,)
             # TODO: 增加视觉效果
