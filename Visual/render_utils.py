@@ -92,3 +92,33 @@ def create_explosion_mesh(position, timer, duration, color=(1.0, 0.5, 0.0)):
     sphere.paint_uniform_color(color)
     sphere.translate(position)
     return sphere
+
+def create_guts_base_mesh(position): #添加基地模型
+    import open3d as o3d
+    import numpy as np
+
+    # 基座：长方体 (长40, 高5, 宽40) 注意：height 沿 Y，depth 沿 Z
+    base = o3d.geometry.TriangleMesh.create_box(width=40.0, height=5.0, depth=40.0)
+    base.paint_uniform_color((0.5, 0.5, 0.5))
+    # 将基座中心移至原点，底部位于 y = -2.5
+    base.translate([-20.0, -2.5, -20.0])
+
+    # 穹顶：球体半径 2.5，位于基座顶面中央 (y = 2.5 处)
+    dome = o3d.geometry.TriangleMesh.create_sphere(radius=12.5)
+    dome.paint_uniform_color((0.2, 0.6, 0.2))
+    dome.translate([0, 2.5, 0])
+
+    # 合并
+    combined = base + dome
+
+    # 旋转：绕 X 轴转 +90 度，使原 Y 轴转向 Z 轴（适配 Z-up 世界）
+    R = combined.get_rotation_matrix_from_xyz((np.pi/2, 0, 0))
+    combined.rotate(R, center=(0, 0, 0))
+
+
+    combined.compute_vertex_normals()
+    combined.translate(position)
+    return combined
+
+
+

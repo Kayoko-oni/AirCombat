@@ -12,8 +12,8 @@ radar:
 
 base:
   health: 100
-  position: [0, 0, 0]
-  # TODO: 实现基地站机制
+  position: [75, 75, 0]
+  collision_radius: 12.5
 
 simulation:
   fps: 30

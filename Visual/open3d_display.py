@@ -1,7 +1,9 @@
 from typing import List
 
+import yaml
+
 from drones.base_drone import BaseDrone
-from Visual.render_utils import create_drone_mesh, create_path_line, create_explosion_mesh, create_drone_model_mesh
+from Visual.render_utils import create_drone_mesh, create_path_line, create_explosion_mesh, create_drone_model_mesh, create_guts_base_mesh
 
 
 class Open3DDisplay:
@@ -78,6 +80,17 @@ class Open3DDisplay:
         material.base_color = (0.92, 0.92, 0.92, 0.95)
         self.scene_widget.scene.add_geometry("ground_plane", ground, material)
 
+    def _add_base_model(self, base_position):
+        """在原点添加基地模型（灰色长方体+绿色球体）"""
+        # 使用我们之前定义的 create_guts_base_mesh 函数
+        from Visual.render_utils import create_guts_base_mesh
+        base_mesh = create_guts_base_mesh(base_position)
+        material = self.rendering.MaterialRecord()
+        material.shader = 'defaultLit'
+        self.scene_widget.scene.add_geometry("base_model", base_mesh, material)
+
+
+
     def _on_layout(self, layout_context):
         r = self.window.content_rect
         self.scene_widget.frame = self.gui.Rect(0, 0, r.width, r.height)
@@ -101,7 +114,7 @@ class Open3DDisplay:
                 best = dist
         return best if best != float("inf") else 0.0
 
-    def _status_text(self, drones: List[BaseDrone]) -> str:
+    def _status_text(self, drones: List[BaseDrone], base_health: float) -> str:
         active = [d for d in drones if not d.destroyed]
         red = [d for d in active if d.drone_type in {"AttackDrone", "TankDrone"}]
         blue = [d for d in active if d.drone_type not in {"AttackDrone", "TankDrone"}]
@@ -115,21 +128,23 @@ class Open3DDisplay:
             f"Red Team: {len(red)}  Blue Team: {len(blue)}",
             f"Attack: {type_counts['AttackDrone']}  Tank: {type_counts['TankDrone']}",
             f"Scout: {type_counts['ScoutDrone']}  Interceptor: {type_counts['InterceptorDrone']}",
+            f"Base Health: {base_health:.1f}",
             "Right-click reset view",
         ]
         return "\n".join(status_lines)
 
-    def update(self, drones: List[BaseDrone], detections):
+    def update(self, drones: List[BaseDrone], detections, base_health: float, base_position):
         if not self.is_open:
             return
         
         # Clear previous geometries except coordinate frame
         self.scene_widget.scene.clear_geometry()
         # Re-add coordinate frame and ground plane
-        coord_frame = self.o3d.geometry.TriangleMesh.create_coordinate_frame(size=20.0)
+        coord_frame = self.o3d.geometry.TriangleMesh.create_coordinate_frame(size=60.0)
         coord_frame.compute_vertex_normals()
         self.scene_widget.scene.add_geometry("coord_frame", coord_frame, self.rendering.MaterialRecord())
-        self._add_ground_plane()
+        self._add_ground_plane()  #参考地面
+        self._add_base_model(base_position)  #基地模型
 
         offensive = [d for d in drones if d.drone_type in {"AttackDrone", "TankDrone"} and not d.destroyed]
         defensive = [d for d in drones if d.drone_type not in {"AttackDrone", "TankDrone"} and not d.destroyed]
@@ -180,7 +195,7 @@ class Open3DDisplay:
             # self.scene_widget.add_3d_label(drone.position, label_text)
 
         # Update status label as HUD
-        status_text = self._status_text(drones)
+        status_text = self._status_text(drones, base_health)
         self.status_label.text = status_text
 
         # Force redraw
