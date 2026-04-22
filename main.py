@@ -14,6 +14,7 @@ from drones.factory import create_drone_team, create_attack_drone, create_tank_d
 from Controller.single_control import chase_target, chase_point, move_drone
 from sensing.radar import RadarSensor
 from utils.logger import get_logger
+from Data.maps.base.base_manager import BaseManager
 
 LOGGER = get_logger(__name__)
 
@@ -62,13 +63,13 @@ def _find_nearest_opponent(drone, candidates):
 _ASSIGNMENT_CONFIG = None
 
 
-def update_chase_strategy(drones, assignment_cfg=None):
-    """输入一个无人机实例列表, 让里面的所有无人机追逐距离自己最近的敌方无人机, 之后要被高阶算法替换"""
+def update_chase_strategy(drones, offensive_target_point, assignment_cfg=None):
+    """输入一个无人机实例列表, 让防守方追击根据任务分配得到的目标进攻方, 进攻方追击传入的offensive_target_point"""
     offensive = [d for d in drones if _is_offensive(d) and d.is_alive()]
     defensive = [d for d in drones if not _is_offensive(d) and d.is_alive()]
     #先将无人机列表中的所有实例遍历, 将它们分为offensive和defensive两个列表
     for drone in offensive:
-        chase_point(drone, [0.0, 0.0, 0.0])
+        chase_point(drone, offensive_target_point)
     #遍历进攻方无人机列表, 将每个无人机的目标设置为地图原点（基地）,
     #如果确认该目标存活, 则调用Controller——single_control——chase_target函数, 使其向目标无人机的位置运动
 
@@ -118,7 +119,7 @@ def balance_defenders(config: dict, drones: list) -> None:
     offensive = [d for d in drones if _is_offensive(d) and d.is_alive()]
     defensive = [d for d in drones if not _is_offensive(d) and d.is_alive()]
     # 计算需要补充的防守方数量
-    need = len(offensive) - len(defensive)
+    need = max(0, len(offensive) - len(defensive))
     if need <= 0:
         return  #如果防守方数量大于进攻方，则直接返回
     # 一次性生成 need 架防守方（固定在基地）
@@ -163,6 +164,8 @@ def run_simulation(config: dict):
 
     drones = create_drone_team(config)
     #创建无人机初始团队
+    base_manager = BaseManager(config)
+    #创建基地管理器实例, 从配置中读取基地的相关参数
     radar = RadarSensor(range_m=config["radar"]["range"], pulse_interval=config["radar"]["pulse_interval"])
     #创建雷达传感器实例, 从配置中读取range_m和pulse_interval
     display = None
@@ -181,6 +184,7 @@ def run_simulation(config: dict):
     duration = config["simulation"]["duration"]
     next_spawn_time = random.uniform(1.0, 3.0)
     spawn_timer = 0.0
+    base_position = config["base"]["position"]   # 例如 [0, 0, 0]
 
     #将帧率fps的值设置为配置中simulation-fps的值
     #frame_time 为一帧所持续的时间
@@ -191,37 +195,51 @@ def run_simulation(config: dict):
 
 
     try:
-        while duration <= 0 or time.time() - start_time < duration:
-            # 当 duration<=0 时表示无限运行，否则按配置时长运行
-            update_chase_strategy(drones, _ASSIGNMENT_CONFIG)
-            # 更新每架无人机的追逐策略 """
-            collisions = detect_collisions(drones)
-            # 收集这一帧中发生碰撞的无人机的列表"""
+        while (duration <= 0 or time.time() - start_time < duration) and not base_manager.is_destroyed():
+            # 当 duration<=0 时表示无限运行，否则按配置时长运行, 同时如果基地被摧毁了也要结束仿真
+
+            #1.碰撞检测与处理
+            collisions = detect_collisions(drones)  # 收集这一帧中发生碰撞的无人机的列表"""
             if collisions:
-                resolve_collisions(collisions)
-            #如果在这一帧中发生了碰撞, 那么对发生碰撞的无人机对执行 Controller——collision_handler——resolve_collisions中的碰撞处理函数"""
+                resolve_collisions(collisions)  #如果在这一帧中发生了碰撞, 那么对发生碰撞的无人机对执行resolve_collisions中的碰撞处理函数"""
 
+            #2. 更新每架无人机的电量, 如果电量耗尽则触发坠毁流程
             for drone in drones:
-                if drone.destroyed:
-                    if drone.falling:
-                        drone.update_fall(frame_time)
-                    elif drone.impact:
-                        drone.update_death_timer(frame_time)
-            #执行完碰撞处理函数后, 遍历所有无人机, 判断它们是否坠毁"""
+                drone.update_battery(frame_time)
 
+            #3. 更新坠毁无人机的状态
+            for drone in drones:
+                if drone.destroyed:  #如果无人机被判定摧毁
+                    if drone.falling:   #如果无人机还在"falling"的过程中
+                        drone.update_fall(frame_time)   #更新它的falling状态
+                    elif drone.impact:  #如果无人机已经落地
+                        drone.update_death_timer(frame_time)    #更新death_timer(播放爆炸动画)
+
+            #4.剔除爆炸结束的无人机，将其从整个仿真中清除
             drones = [d for d in drones if not d.should_remove()]
             #剔除drones列表中所有被 .should_move函数判断为"应该被移除"的无人机, 即更新drone列表"""
 
+            #5.获取存活无人机列表, 如果没有存活的无人机了, 输出到日志, 结束仿真
             alive_drones = [d for d in drones if not d.destroyed]
             if not alive_drones:
                 LOGGER.info("All active drones destroyed, ending simulation.")
                 break
-            #将所有未被摧毁的无人机添加至alive_drone列表, 如果没有存活的无人机了, 输出到日志, 结束仿真"""
 
+            #6. 更新存活无人机的追逐策略
+            update_chase_strategy(alive_drones, base_position, _ASSIGNMENT_CONFIG) #进攻方的目标点暂时设定为基地位置
+            # 更新每架无人机的追逐策略 """
+
+            #7. 更新存活无人机的位置
             for drone in alive_drones:
                 move_drone(drone, frame_time)
             #对在alive_drone列表中(也就是确认存活的)无人机, 执行位置更新操作"""
 
+            #8. 基地碰撞检测
+            if base_manager.check_collisions(drones):
+                LOGGER.info("Base destroyed! Attackers win!")
+                break
+
+            #9. 随机生成进攻无人机
             spawn_timer += frame_time  #随机生成进攻方无人机
             if spawn_timer >= next_spawn_time:
                 spawn_timer = 0.0
@@ -229,15 +247,14 @@ def run_simulation(config: dict):
                 if random.random() < 0.9:
                     spawn_random_drone(config, drones)
 
-            
+            #10. 平衡防守方数量
             balance_defenders(config, drones) #每帧立即平衡防守方数量, 直到防守方数量 >= 进攻方数量"""
-            
 
             detections = radar.scan(alive_drones)
             #雷达扫描一次所有存活的无人机 """
             LOGGER.debug("Detected %d objects", len(detections))
             if display is not None:
-                display.update(drones, detections)
+                display.update(drones, detections, base_manager.get_health(), base_position)
                 if not display.is_open:
                     LOGGER.info("Visualization window closed, ending simulation.")
                     break
