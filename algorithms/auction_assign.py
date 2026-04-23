@@ -7,6 +7,11 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
+_MAX_BATTERY_REF = 120.0
+_MAX_HEALTH_REF = 150.0
+_MAX_SPEED_REF = 40.0
+_MAX_ATTACK_POWER_REF = 30.0
+
 try:
     # 优先复用 AirCombat 已定义的几何距离函数。
     _aircombat_distance = getattr(import_module("utils.geometry"), "distance")
@@ -47,6 +52,21 @@ class ImprovedAuctionConfig:
     warm_start_fraction: float = 0.35
     enable_local_refine: bool = True
     local_refine_rounds: int = 5
+    communication_range: float = 280.0
+    max_operational_distance: float = 1200.0
+    response_distance_weight: float = 0.55
+    response_energy_weight: float = 0.30
+    response_health_weight: float = 0.15
+    response_threshold: float = 0.30
+    attention_temperature: float = 0.70
+    distance_weight: float = 1.0
+    urgency_weight: float = 35.0
+    load_balance_weight: float = 18.0
+    feasibility_weight: float = 16.0
+    attention_weight: float = 22.0
+    non_responder_penalty: float = 55.0
+    sticky_assignment_bonus: float = 10.0
+    reassignment_penalty: float = 6.0
 
 
 class ImprovedAuctionSolver:
@@ -290,50 +310,6 @@ class ImprovedAuctionSolver:
                 break
 
 
-def build_utility_from_positions(
-    agent_positions: np.ndarray,
-    task_positions: np.ndarray,
-    task_values: np.ndarray,
-    distance_weight: float = 1.0,
-) -> np.ndarray:
-    """由位置信息和任务价值构建效用矩阵。
-
-    公式：utility(i, j) = task_value(j) - distance_weight * distance(agent_i, task_j)
-    """
-
-    agent_positions = np.asarray(agent_positions, dtype=np.float64)
-    task_positions = np.asarray(task_positions, dtype=np.float64)
-    task_values = np.asarray(task_values, dtype=np.float64)
-
-    if agent_positions.ndim != 2 or task_positions.ndim != 2:
-        raise ValueError("agent_positions and task_positions must be 2D arrays")
-
-    if agent_positions.shape[1] != task_positions.shape[1]:
-        raise ValueError("agent_positions and task_positions must share dimension")
-
-    if task_values.ndim != 1 or task_values.size != task_positions.shape[0]:
-        raise ValueError("task_values must be 1D with same length as task_positions")
-
-    # 广播后得到两两差分张量：[n_agents, n_tasks, dim]。
-    diff = agent_positions[:, None, :] - task_positions[None, :, :]
-    distances = np.linalg.norm(diff, axis=2)
-    utility = task_values[None, :] - distance_weight * distances
-    return utility
-
-
-def auction_assign(drones: List[Any], tasks: List[dict]) -> dict:
-    """AirCombat 兼容的占位接口。
-
-    保留原始轮转分配行为，确保旧调用方不需要改动。
-    """
-
-    # 保持该接口稳定，避免影响主循环中的既有调用。
-    assignment = {}
-    for index, drone in enumerate(drones):
-        assignment[drone.name] = tasks[index % len(tasks)] if tasks else None
-    return assignment
-
-
 def greedy_assignment(
     defenders: List[Any],
     attackers: List[Any],
@@ -351,10 +327,12 @@ def greedy_assignment(
     if not attackers:
         return {d.name: None for d in defenders}
 
-    # 直接基于 AirCombat 的 distance 构建效用矩阵（负距离越大越优）。
-    utility = _build_distance_only_utility(defenders, attackers)
+    cfg = config or ImprovedAuctionConfig()
 
-    solver = ImprovedAuctionSolver(config or ImprovedAuctionConfig())
+    # 将论文中的“提议-响应-选择”思想落地为效用增强，而非仅做纯距离匹配。
+    utility = _build_cma_enhanced_utility(defenders, attackers, cfg)
+
+    solver = ImprovedAuctionSolver(cfg)
     n_def, n_att = utility.shape
 
     assignment: Dict[str, Optional[Any]] = {d.name: None for d in defenders}
@@ -365,6 +343,7 @@ def greedy_assignment(
         for attacker_idx, defender_idx in enumerate(result.task_to_agent.tolist()):
             defender = defenders[int(defender_idx)]
             assignment[defender.name] = attackers[attacker_idx]
+        _remember_assignment(assignment)
         return assignment
 
     # 当防守方少于进攻方时，对转置矩阵求解，保证每个防守方仍只匹配一个目标，
@@ -374,15 +353,29 @@ def greedy_assignment(
         defender = defenders[defender_idx]
         assignment[defender.name] = attackers[int(attacker_idx)]
 
+    _remember_assignment(assignment)
     return assignment
 
 
-def _build_distance_only_utility(defenders: List[Any], attackers: List[Any]) -> np.ndarray:
-    """构建“仅距离项”的效用矩阵（值越大越好）。
+_LAST_TARGET_BY_DEFENDER: Dict[str, str] = {}
 
-    由于目标是最小化距离，这里取负距离作为效用：utility = -distance。
-    """
 
+def _remember_assignment(assignment: Dict[str, Optional[Any]]) -> None:
+    """缓存上一帧分配结果，用于抑制频繁切换目标。"""
+    global _LAST_TARGET_BY_DEFENDER
+    next_mapping: Dict[str, str] = {}
+    for defender_name, attacker in assignment.items():
+        if attacker is not None:
+            next_mapping[defender_name] = str(getattr(attacker, "name", ""))
+    _LAST_TARGET_BY_DEFENDER = next_mapping
+
+
+def _build_cma_enhanced_utility(
+    defenders: List[Any],
+    attackers: List[Any],
+    cfg: ImprovedAuctionConfig,
+) -> np.ndarray:
+    """构建融合“提议-响应-选择”机制的效用矩阵。"""
     if _aircombat_distance is None:
         raise ImportError(
             "未找到 utils.geometry.distance。请将本文件放入 AirCombat 仓库后再运行。"
@@ -392,7 +385,233 @@ def _build_distance_only_utility(defenders: List[Any], attackers: List[Any]) -> 
     n_att = len(attackers)
     utility = np.zeros((n_def, n_att), dtype=np.float64)
 
-    for i, d in enumerate(defenders):
-        for j, a in enumerate(attackers):
-            utility[i, j] = -float(_aircombat_distance(d.position, a.position))
+    defender_loads = np.asarray([_estimate_defender_load(d) for d in defenders], dtype=np.float64)
+    task_urgencies = np.asarray(
+        [_estimate_attacker_urgency(a, cfg.max_operational_distance) for a in attackers],
+        dtype=np.float64,
+    )
+
+    for attacker_idx, attacker in enumerate(attackers):
+        # Stage-1 提议：选择离该任务最近的防守方作为提议者。
+        proposer_idx = _select_proposer(defenders, attacker)
+        # Stage-2 响应：提议者仅与通信半径内成员协商。
+        candidate_indices = _collect_candidates(defenders, proposer_idx, cfg.communication_range)
+        feasible_scores = _response_feasibility_scores(defenders, attacker, cfg, candidate_indices)
+
+        feasible_map = {
+            idx
+            : score
+            for idx, score in zip(candidate_indices, feasible_scores)
+            if score >= cfg.response_threshold
+        }
+        if not feasible_map:
+            feasible_map = {proposer_idx: 0.0}
+        responders = list(feasible_map)
+        responder_set = set(responders)
+
+        # Stage-3 选择：在可响应集合内进行注意力匹配打分。
+        attention_map = _cma_attention_scores(defenders, attacker, responders, cfg)
+        urgency = float(task_urgencies[attacker_idx])
+
+        for defender_idx, defender in enumerate(defenders):
+            distance = float(_aircombat_distance(defender.position, attacker.position))
+            base = -cfg.distance_weight * distance
+            urgency_term = cfg.urgency_weight * urgency
+            load_term = cfg.load_balance_weight * (1.0 - float(defender_loads[defender_idx]))
+
+            responder_term = 0.0
+            if defender_idx in responder_set:
+                feasibility = float(feasible_map.get(defender_idx, 0.0))
+                attention = float(attention_map.get(defender_idx, 0.0))
+                responder_term += cfg.feasibility_weight * feasibility
+                responder_term += cfg.attention_weight * attention
+            else:
+                # 非响应节点直接降权，避免通信受限时被误选。
+                responder_term -= cfg.non_responder_penalty
+
+            defender_name = str(getattr(defender, "name", ""))
+            attacker_name = str(getattr(attacker, "name", ""))
+            previous = _LAST_TARGET_BY_DEFENDER.get(defender_name)
+            if previous == attacker_name:
+                # 维持原锁定目标会获得粘性奖励，降低抖动重分配。
+                switch_term = cfg.sticky_assignment_bonus
+            elif previous is None:
+                switch_term = 0.0
+            else:
+                # 有历史目标但本轮切换时施加惩罚。
+                switch_term = -cfg.reassignment_penalty
+
+            utility[defender_idx, attacker_idx] = (
+                base + urgency_term + load_term + responder_term + switch_term
+            )
+
     return utility
+
+
+def _select_proposer(defenders: List[Any], attacker: Any) -> int:
+    """按距离最近原则选择提议无人机。"""
+    if not defenders:
+        raise ValueError("defenders must be non-empty")
+    best_idx = 0
+    best_dist = float("inf")
+    for idx, defender in enumerate(defenders):
+        dist = float(_aircombat_distance(defender.position, attacker.position))
+        if dist < best_dist:
+            best_dist = dist
+            best_idx = idx
+    return best_idx
+
+
+def _collect_candidates(
+    defenders: List[Any],
+    proposer_idx: int,
+    communication_range: float,
+) -> List[int]:
+    """收集提议者通信范围内的候选防守方。"""
+    proposer = defenders[proposer_idx]
+    candidates = []
+    for idx, defender in enumerate(defenders):
+        d_comm = float(_aircombat_distance(proposer.position, defender.position))
+        if d_comm <= communication_range:
+            candidates.append(idx)
+    if proposer_idx not in candidates:
+        candidates.append(proposer_idx)
+    return candidates
+
+
+def _response_feasibility_scores(
+    defenders: List[Any],
+    attacker: Any,
+    cfg: ImprovedAuctionConfig,
+    candidate_indices: List[int],
+) -> List[float]:
+    """按距离/电量/血量计算响应可行性分数。"""
+    scores: List[float] = []
+
+    for idx in candidate_indices:
+        defender = defenders[idx]
+        distance_score = _pair_distance_score(defender, attacker, cfg.max_operational_distance)
+        energy_score, health_score = _defender_resource_scores(defender)
+        score = (
+            cfg.response_distance_weight * distance_score
+            + cfg.response_energy_weight * energy_score
+            + cfg.response_health_weight * health_score
+        )
+        scores.append(float(np.clip(score, 0.0, 1.0)))
+
+    return scores
+
+
+def _cma_attention_scores(
+    defenders: List[Any],
+    attacker: Any,
+    responder_indices: List[int],
+    cfg: ImprovedAuctionConfig,
+) -> Dict[int, float]:
+    """用轻量注意力计算任务与候选防守方的匹配权重。"""
+    if not responder_indices:
+        return {}
+
+    closeness, task_speed, task_attack, task_health = _attacker_scores(
+        attacker, cfg.max_operational_distance
+    )
+    urgency = _estimate_attacker_urgency(attacker, cfg.max_operational_distance)
+
+    q = np.asarray(
+        [
+            urgency,
+            closeness,
+            task_speed,
+            task_attack,
+            task_health,
+        ],
+        dtype=np.float64,
+    )
+
+    logits: List[float] = []
+    for idx in responder_indices:
+        defender = defenders[idx]
+        # key 向量体现候选防守方对当前任务的执行能力。
+        energy_score, health_score = _defender_resource_scores(defender)
+        k = np.asarray(
+            [
+                _pair_distance_score(defender, attacker, cfg.max_operational_distance),
+                _ratio(_speed(defender), _MAX_SPEED_REF),
+                energy_score,
+                health_score,
+                1.0 - _estimate_defender_load(defender),
+            ],
+            dtype=np.float64,
+        )
+        score = float(np.dot(q, k) / np.sqrt(q.size))
+        logits.append(score / max(cfg.attention_temperature, 1e-6))
+
+    probs = _softmax(np.asarray(logits, dtype=np.float64))
+    return {idx: float(p) for idx, p in zip(responder_indices, probs.tolist())}
+
+
+def _estimate_attacker_urgency(attacker: Any, max_operational_distance: float = 1200.0) -> float:
+    """估计任务紧急度代理值，输出范围 [0, 1]。"""
+    closeness, speed_score, attack_score, health_score = _attacker_scores(
+        attacker, max_operational_distance
+    )
+    urgency = 0.35 * closeness + 0.25 * speed_score + 0.25 * attack_score + 0.15 * health_score
+    return float(np.clip(urgency, 0.0, 1.0))
+
+
+def _estimate_defender_load(defender: Any) -> float:
+    """估计防守方当前负载，值越大表示越繁忙。"""
+    battery_ratio, health_ratio = _defender_resource_scores(defender)
+    load = 0.7 * (1.0 - battery_ratio) + 0.3 * (1.0 - health_ratio)
+    return float(np.clip(load, 0.0, 1.0))
+
+
+def _attacker_scores(attacker: Any, max_operational_distance: float) -> tuple[float, float, float, float]:
+    """提取任务端归一化特征：接近基地、速度、攻击力、血量。"""
+    closeness = 1.0 - _ratio(_norm_to_base(attacker), max_operational_distance)
+    speed_score = _ratio(_speed(attacker), _MAX_SPEED_REF)
+    attack_score = _ratio(getattr(attacker, "attack_power", 0.0), _MAX_ATTACK_POWER_REF)
+    health_score = _ratio(getattr(attacker, "health", 0.0), _MAX_HEALTH_REF)
+    return closeness, speed_score, attack_score, health_score
+
+
+def _defender_resource_scores(defender: Any) -> tuple[float, float]:
+    """提取防守端归一化资源特征：电量、血量。"""
+    energy_score = _ratio(getattr(defender, "battery", 0.0), _MAX_BATTERY_REF)
+    health_score = _ratio(getattr(defender, "health", 0.0), _MAX_HEALTH_REF)
+    return energy_score, health_score
+
+
+def _pair_distance_score(defender: Any, attacker: Any, max_operational_distance: float) -> float:
+    """将防守方与任务的距离映射为 [0, 1] 可行性分数。"""
+    distance = float(_aircombat_distance(defender.position, attacker.position))
+    return 1.0 - _ratio(distance, max_operational_distance)
+
+
+def _speed(drone: Any) -> float:
+    """计算无人机速度模长。"""
+    velocity = np.asarray(getattr(drone, "velocity", [0.0, 0.0, 0.0]), dtype=np.float64)
+    return float(np.linalg.norm(velocity))
+
+
+def _norm_to_base(drone: Any) -> float:
+    """计算无人机相对基地(原点)的距离。"""
+    position = np.asarray(getattr(drone, "position", [0.0, 0.0, 0.0]), dtype=np.float64)
+    return float(np.linalg.norm(position))
+
+
+def _ratio(value: float, max_value: float) -> float:
+    """将值归一化到 [0, 1]，并处理零分母。"""
+    if max_value <= 0:
+        return 0.0
+    return float(np.clip(value / max_value, 0.0, 1.0))
+
+
+def _softmax(x: np.ndarray) -> np.ndarray:
+    """数值稳定版 softmax。"""
+    x = x - np.max(x)
+    ex = np.exp(x)
+    denom = np.sum(ex)
+    if denom <= 0:
+        return np.full_like(ex, 1.0 / max(ex.size, 1))
+    return ex / denom
