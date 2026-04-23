@@ -13,57 +13,60 @@ def create_drone_model_mesh(position, color=(1.0, 0.0, 0.0)):
     import open3d as o3d
     import numpy as np
 
-    # ------------------ 基座 ------------------
-    base_size = 2.5
-    base_thick = 1.5
-    base = o3d.geometry.TriangleMesh.create_box(width=base_size, height=base_size, depth=base_thick)
-    base.translate([-base_size/2, -base_size/2, -base_thick/2])
-    base.paint_uniform_color((0.5, 0.5, 0.5))
+    # ------------------ 十字悬臂（X轴和Y轴方向的扁立方体） ------------------
+    arm_length = 8.0
+    arm_width = 0.4
+    arm_height = 0.15
+    # X方向臂
+    arm_x = o3d.geometry.TriangleMesh.create_box(width=arm_length, height=arm_width, depth=arm_height)
+    arm_x.translate([-arm_length/2, -arm_width/2, -arm_height/2])
+    arm_x.paint_uniform_color((0.6, 0.6, 0.6))
+    # Y方向臂
+    arm_y = o3d.geometry.TriangleMesh.create_box(width=arm_width, height=arm_length, depth=arm_height)
+    arm_y.translate([-arm_width/2, -arm_length/2, -arm_height/2])
+    arm_y.paint_uniform_color((0.6, 0.6, 0.6))
 
-    corner_z = base_thick / 2
-    corners = [
-        ( base_size/2,  base_size/2, corner_z),
-        ( base_size/2, -base_size/2, corner_z),
-        (-base_size/2,  base_size/2, corner_z),
-        (-base_size/2, -base_size/2, corner_z),
+    # ------------------ 机身（扁立方体，放在十字臂中央上方） ------------------
+    body = o3d.geometry.TriangleMesh.create_box(width=2.5, height=2.5, depth=1.5)
+    body.translate([-1.25, -1.25, arm_height])  # 放在臂的上面
+    body.paint_uniform_color((0.4, 0.4, 0.4))
+
+    # ------------------ 旋翼：圆盘（压扁球体）位于四个臂的末端 ------------------
+    endpoints = [
+        ( arm_length/2,  0, arm_height),
+        (-arm_length/2,  0, arm_height),
+        ( 0,  arm_length/2, arm_height),
+        ( 0, -arm_length/2, arm_height)
     ]
-
-    # ------------------ 旋翼中心 ------------------
-    arm_extension = 1.8
-    rotor_z = corner_z + 0.2
-    rotor_centers = [
-        ( corners[0][0] + arm_extension,  corners[0][1] + arm_extension, rotor_z),
-        ( corners[1][0] + arm_extension,  corners[1][1] - arm_extension, rotor_z),
-        ( corners[2][0] - arm_extension,  corners[2][1] + arm_extension, rotor_z),
-        ( corners[3][0] - arm_extension,  corners[3][1] - arm_extension, rotor_z),
-    ]
-
-    # ------------------ 旋翼（压扁球体，水平圆盘） ------------------
-    rotor_diameter = 1.6
-    rotor_thick = 0.1
     rotors = []
     motors = []
-    for pos in rotor_centers:
+    rotor_diameter = 1.6
+    rotor_thick = 0.1
+    for ex, ey, ez in endpoints:
         rotor = o3d.geometry.TriangleMesh.create_sphere(radius=rotor_diameter/2)
         vertices = np.asarray(rotor.vertices)
-        vertices[:, 2] *= (rotor_thick / rotor_diameter)
+        vertices[:, 2] *= (rotor_thick / rotor_diameter)  # 压扁成圆盘
         rotor.vertices = o3d.utility.Vector3dVector(vertices)
         rotor.compute_vertex_normals()
-        rotor.translate(pos)
+        rotor.translate([ex, ey, ez])
         rotor.paint_uniform_color(color)
         rotors.append(rotor)
 
         motor = o3d.geometry.TriangleMesh.create_sphere(radius=0.25)
-        motor.translate(pos)
+        motor.translate([ex, ey, ez])
         motor.paint_uniform_color((0.2, 0.2, 0.2))
         motors.append(motor)
 
     # ------------------ 合并 ------------------
-    combined = base
+    combined = arm_x + arm_y + body
     for rotor in rotors:
         combined += rotor
     for motor in motors:
         combined += motor
+
+    # ------------------ 整体上下翻转（绕 X 轴旋转 180 度） ------------------
+    R = combined.get_rotation_matrix_from_xyz((np.pi, 0, 0))  # 绕 X 轴转 180 度
+    combined.rotate(R, center=(0, 0, 0))
 
     combined.compute_vertex_normals()
     combined.translate(position)
