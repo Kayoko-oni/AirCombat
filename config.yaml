@@ -17,13 +17,13 @@ base:
 
 simulation:
   fps: 30
-  duration: 0
+  duration: 100
   # 0 表示无限运行时间，直到手动关闭程序
   # TODO: 添加暂停/恢复控制和保存/加载状态
 
 assignment:
   # 改进拍卖 + CMA 动态分配参数（默认调优版，可在此直接调参）
-  epsilon_start: 0.8
+  epsilon_start: 0.8 # 贪婪搜索参数
   epsilon_end: 0.002
   epsilon_decay: 0.25
   max_iterations_per_phase: 12000
@@ -33,14 +33,14 @@ assignment:
   enable_local_refine: true
   local_refine_rounds: 6
 
-  communication_range: 320.0
+  communication_range: 320.0 # 通信参数
   max_operational_distance: 1200.0
   response_distance_weight: 0.5
   response_energy_weight: 0.35
   response_health_weight: 0.15
   response_threshold: 0.38
 
-  attention_temperature: 0.6
+  attention_temperature: 0.6 # 约束条件参数
   distance_weight: 1.0
   urgency_weight: 32.0
   load_balance_weight: 20.0
