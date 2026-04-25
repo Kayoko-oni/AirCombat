@@ -23,7 +23,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from Controller.collision_handler import detect_collisions, resolve_collisions
 from Controller.single_control import chase_point, chase_target, move_drone
-from Data.maps.base.base_manager import BaseManager
+from base.base_manager import BaseManager
 from algorithms.auction_assign import ImprovedAuctionConfig, greedy_assignment
 from algorithms.cbs_pathplan import cbs_plan_paths
 from drones.factory import (

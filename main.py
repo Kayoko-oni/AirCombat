@@ -14,7 +14,7 @@ from drones.factory import create_drone_team, create_attack_drone, create_tank_d
 from Controller.single_control import chase_target, chase_point, move_drone
 from sensing.radar import RadarSensor
 from utils.logger import get_logger
-from Data.maps.base.base_manager import BaseManager
+from base.base_manager import BaseManager
 
 LOGGER = get_logger(__name__)
 
