@@ -40,6 +40,9 @@ class Open3DDisplay:
         
         self.is_open = True
         self.paused = False
+
+        self.static_objects_added = False      # 静态物体是否已添加
+        self.dynamic_geometries = set()        # 存储动态几何体的名称
         
         # Set up camera
         import numpy as np
@@ -61,11 +64,6 @@ class Open3DDisplay:
         self.scene_widget.set_on_mouse(self._mouse_callback)
         self.window.set_on_layout(self._on_layout)
         self.window.show(True)
-        # Add coordinate frame
-        coord_frame = self.o3d.geometry.TriangleMesh.create_coordinate_frame(size=20.0)
-        coord_frame.compute_vertex_normals()
-        self.scene_widget.scene.add_geometry("coord_frame", coord_frame, self.rendering.MaterialRecord())
-        self._add_ground_plane()
 
     def _add_ground_plane(self):
         ground = self.o3d.geometry.TriangleMesh.create_box(
@@ -79,6 +77,17 @@ class Open3DDisplay:
         material = self.rendering.MaterialRecord()
         material.base_color = (0.92, 0.92, 0.92, 0.95)
         self.scene_widget.scene.add_geometry("ground_plane", ground, material)
+
+    def _add_static_objects(self, base_position):
+        # 坐标轴
+        coord_frame = self.o3d.geometry.TriangleMesh.create_coordinate_frame(size=60.0)
+        coord_frame.compute_vertex_normals()
+        self.scene_widget.scene.add_geometry("coord_frame", coord_frame, self.rendering.MaterialRecord())
+        # 地面
+        self._add_ground_plane()
+        # 基地模型
+        self._add_base_model(base_position)
+        self.static_objects_added = True
 
     def _add_base_model(self, base_position):
         """在原点添加基地模型（灰色长方体+绿色球体）"""
@@ -137,14 +146,12 @@ class Open3DDisplay:
         if not self.is_open:
             return
         
-        # Clear previous geometries except coordinate frame
-        self.scene_widget.scene.clear_geometry()
-        # Re-add coordinate frame and ground plane
-        coord_frame = self.o3d.geometry.TriangleMesh.create_coordinate_frame(size=60.0)
-        coord_frame.compute_vertex_normals()
-        self.scene_widget.scene.add_geometry("coord_frame", coord_frame, self.rendering.MaterialRecord())
-        self._add_ground_plane()  #参考地面
-        self._add_base_model(base_position)  #基地模型
+        if not self.static_objects_added: #只在首次更新时添加静态物体（坐标轴、地面、基地模型）
+            self._add_static_objects(base_position)
+
+        for name in self.dynamic_geometries:
+            self.scene_widget.scene.remove_geometry(name)
+        self.dynamic_geometries.clear()
 
         offensive = [d for d in drones if d.drone_type in {"AttackDrone", "TankDrone"} and not d.destroyed]
         defensive = [d for d in drones if d.drone_type not in {"AttackDrone", "TankDrone"} and not d.destroyed]
@@ -157,12 +164,14 @@ class Open3DDisplay:
                     material = self.rendering.MaterialRecord()
                     material.base_color = explosion_color + (1.0,)
                     self.scene_widget.scene.add_geometry(f"explosion_{drone.name}", debris, material)
+                    self.dynamic_geometries.add(f"explosion_{drone.name}")
                 else:
                     fall_color = (0.6, 0.1, 0.1) if drone.drone_type in {"AttackDrone", "TankDrone"} else (0.1, 0.1, 0.6)
                     mesh = create_drone_mesh(drone.position, color=fall_color)
                     material = self.rendering.MaterialRecord()
                     material.base_color = fall_color + (1.0,)
                     self.scene_widget.scene.add_geometry(f"falling_{drone.name}", mesh, material)
+                    self.dynamic_geometries.add(f"falling_{drone.name}")
                     if len(drone.trail) > 1:
                         path = create_path_line(drone.trail, color=fall_color)
                         if path is not None:
@@ -170,6 +179,7 @@ class Open3DDisplay:
                             material_trail.shader = 'unlitLine'
                             material_trail.base_color = fall_color + (1.0,)
                             self.scene_widget.scene.add_geometry(f"trail_{drone.name}", path, material_trail)
+                            self.dynamic_geometries.add(f"trail_{drone.name}")
                 continue
 
             color = self._drone_color(drone)
@@ -178,6 +188,7 @@ class Open3DDisplay:
             material.base_color = color + (1.0,)
             # TODO: 增加视觉效果
             self.scene_widget.scene.add_geometry(f"drone_{drone.name}", mesh, material)
+            self.dynamic_geometries.add(f"drone_{drone.name}")
 
             if len(drone.trail) > 1:
                 trail_color = (1.0, 0.2, 0.2) if drone.drone_type in {"AttackDrone", "TankDrone"} else (0.2, 0.4, 1.0)
@@ -187,7 +198,7 @@ class Open3DDisplay:
                     material_trail.shader = 'unlitLine'
                     material_trail.base_color = trail_color + (1.0,)
                     self.scene_widget.scene.add_geometry(f"trail_{drone.name}", path, material_trail)
-
+                    self.dynamic_geometries.add(f"trail_{drone.name}")
             enemies = defensive if drone in offensive else offensive
             nearest_dist = self._nearest_enemy_distance(drone, enemies)
             # Removed 3D label for each drone to reduce clutter
