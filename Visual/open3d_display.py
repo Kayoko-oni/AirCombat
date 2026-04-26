@@ -1,7 +1,9 @@
 from typing import List
+import numpy as np
 
 import yaml
 
+from utils.map_loader import generate_buildings
 from drones.base_drone import BaseDrone
 from Visual.render_utils import create_drone_mesh, create_path_line, create_explosion_mesh, create_drone_model_mesh, create_guts_base_mesh
 
@@ -78,7 +80,7 @@ class Open3DDisplay:
         material.base_color = (0.92, 0.92, 0.92, 0.95)
         self.scene_widget.scene.add_geometry("ground_plane", ground, material)
 
-    def _add_static_objects(self, base_position):
+    def _add_static_objects(self, base_position):  #只在首次更新时添加静态物体（坐标轴、地面、基地模型、建筑）
         # 坐标轴
         coord_frame = self.o3d.geometry.TriangleMesh.create_coordinate_frame(size=60.0)
         coord_frame.compute_vertex_normals()
@@ -87,6 +89,11 @@ class Open3DDisplay:
         self._add_ground_plane()
         # 基地模型
         self._add_base_model(base_position)
+
+        #两种生成建筑的方式，注释掉另外一种即可使用
+        self._add_buildings()
+        #self._add_obj_model("Data/maps/HK_map.obj", target_size=1500.0)
+
         self.static_objects_added = True
 
     def _add_base_model(self, base_position):
@@ -97,7 +104,25 @@ class Open3DDisplay:
         material = self.rendering.MaterialRecord()
         material.shader = 'defaultLit'
         self.scene_widget.scene.add_geometry("base_model", base_mesh, material)
-
+        
+    def _add_buildings(self):
+        buildings = generate_buildings()  # 生成随机建筑，这个接口之后可以接上 读取.obj文件的函数
+        if not buildings:
+            return
+        combined = self.o3d.geometry.TriangleMesh()
+        for center, size in buildings:
+            cx, cy, cz = center
+            sx, sy, sz = size
+            box = self.o3d.geometry.TriangleMesh.create_box(width=sx, height=sy, depth=sz)
+            box.translate([cx - sx/2, cy - sy/2, cz - sz/2])
+            box.paint_uniform_color((0.92, 0.92, 0.92))   # 灰色
+            combined += box
+        combined.compute_vertex_normals()
+        material = self.rendering.MaterialRecord()
+        material.shader = 'defaultLit'
+        material.base_color = (0.92, 0.92, 0.92, 0.95)   # 半透明，与地面协调
+        self.scene_widget.scene.add_geometry("city_buildings", combined, material)
+        print("Static buildings added.")
 
 
     def _on_layout(self, layout_context):
