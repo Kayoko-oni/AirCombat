@@ -88,6 +88,56 @@ def create_path_line(points, color=(1.0, 0.0, 0.0)):
     return line_set
 
 
+def create_dashed_line(start, end, color=(1.0, 0.8, 0.0), dash_length=8.0, gap_length=6.0):
+    """Create a dashed LineSet between two 3D points.
+
+    start, end: sequence-like of length 3
+    dash_length, gap_length: in same units as points
+    """
+    start = np.array(start, dtype=float)
+    end = np.array(end, dtype=float)
+    vec = end - start
+    dist = np.linalg.norm(vec)
+    if dist < 1e-6:
+        return None
+    dirv = vec / dist
+    segment = dash_length + gap_length
+    count = int(dist // segment)
+    points = []
+    lines = []
+    idx = 0
+    def push_seg(a, b):
+        nonlocal idx
+        points.append(a.tolist())
+        points.append(b.tolist())
+        lines.append([idx, idx + 1])
+        idx += 2
+
+    for i in range(count):
+        s = start + dirv * (i * segment)
+        e = start + dirv * (i * segment + dash_length)
+        push_seg(s, e)
+
+    # tail
+    tail_start = count * segment
+    if tail_start < dist:
+        s = start + dirv * tail_start
+        e = start + dirv * min(tail_start + dash_length, dist)
+        push_seg(s, e)
+
+    if not points:
+        return None
+
+    import open3d as o3d
+    line_set = o3d.geometry.LineSet(
+        points=o3d.utility.Vector3dVector(points),
+        lines=o3d.utility.Vector2iVector(lines),
+    )
+    colors = [list(color) for _ in range(len(lines))]
+    line_set.colors = o3d.utility.Vector3dVector(colors)
+    return line_set
+
+
 def create_explosion_mesh(position, timer, duration, color=(1.0, 0.5, 0.0)):
     radius = 3.0 + 6.0 * min(1.0, timer / max(duration, 1e-3))
     sphere = o3d.geometry.TriangleMesh.create_sphere(radius=radius)

@@ -63,13 +63,57 @@ def _find_nearest_opponent(drone, candidates):
 _ASSIGNMENT_CONFIG = None
 
 
-def update_chase_strategy(drones, offensive_target_point, assignment_cfg=None):
-    """输入一个无人机实例列表, 让防守方追击根据任务分配得到的目标进攻方, 进攻方追击传入的offensive_target_point"""
+def update_chase_strategy(drones, offensive_target_point, assignment_cfg=None, map_grid=None):
+    """输入一个无人机实例列表, 让防守方追击根据任务分配得到的目标进攻方, 进攻方追击传入的offensive_target_point
+
+    参数说明：
+    - drones: 无人机实例列表
+    - offensive_target_point: 进攻方的公共目标点
+    - assignment_cfg: 任务分配配置
+    - map_grid: 可选的 MapGrid 实例（来自 display.map_grid）。若提供则尝试使用 CBS 进行二维路径规划，输出为每架防守方的下一步航点。
+
+    兼容性：当 map_grid 为 None 时，退化为原有的直接追逐逻辑。
+    """
     offensive = [d for d in drones if _is_offensive(d) and d.is_alive()]
     defensive = [d for d in drones if not _is_offensive(d) and d.is_alive()]
+    # 清理之前的分配标记
+    for dd in defensive:
+        try:
+            dd._assigned_target = None
+        except Exception:
+            pass
     #先将无人机列表中的所有实例遍历, 将它们分为offensive和defensive两个列表
+    # 进攻方：优先尝试轻量避障——若与目标在 XY 投影上不可直达，则用单体 A* 规划并追踪第一航点
     for drone in offensive:
-        chase_point(drone, offensive_target_point)
+        used_light_plan = False
+        if map_grid is not None:
+            try:
+                from algorithms.cbs_pathplan import line_of_sight_world, a_star_plan_world
+            except Exception:
+                line_of_sight_world = None
+                a_star_plan_world = None
+
+            try:
+                pos = tuple(drone.position[:3])
+                # 如果不可直达，尝试做一个快速单体 A* 规划
+                if line_of_sight_world is not None and not line_of_sight_world(pos, offensive_target_point, map_grid):
+                    if a_star_plan_world is not None:
+                        path = a_star_plan_world(pos, offensive_target_point, map_grid, max_time_ms=50)
+                        if path:
+                            try:
+                                drone._avoid_path = path
+                                drone._avoid_idx = 1 if len(path) > 1 else 0
+                                next_wp = path[drone._avoid_idx]
+                                # 直接追踪第一个航点（map_grid=None 以避免再次触发规划器）
+                                chase_point(drone, next_wp, map_grid=None)
+                                used_light_plan = True
+                            except Exception:
+                                used_light_plan = False
+            except Exception:
+                used_light_plan = False
+
+        if not used_light_plan:
+            chase_point(drone, offensive_target_point, map_grid=map_grid)
     #遍历进攻方无人机列表, 将每个无人机的目标设置为地图原点（基地）,
     #如果确认该目标存活, 则调用Controller——single_control——chase_target函数, 使其向目标无人机的位置运动
 
@@ -81,14 +125,85 @@ def update_chase_strategy(drones, offensive_target_point, assignment_cfg=None):
         assignment = greedy_assignment(defensive, offensive, config=assignment_cfg)  # 键是名字字符串
         # 构建名字到防守方对象的映射
         name_to_defender = {d.name: d for d in defensive}
+        # 将 assignment 转为 (defender_obj, goal_pos) 列表供 CBS 使用
+        pairs = []
+        defenders_order = []
         for def_name, target in assignment.items():
             defender = name_to_defender.get(def_name)
             if defender is None:
                 continue
             if target is not None:
-                chase_target(defender, target)
+                # 目标可以是一个无人机实例，取其当前世界位置作为规划目标
+                # 记录分配给 defender 的目标对象，供可视化使用
+                try:
+                    defender._assigned_target = target
+                except Exception:
+                    pass
+                goal_pos = target.position if hasattr(target, "position") else None
+                if goal_pos is not None:
+                    pairs.append((defender, goal_pos))
+                    defenders_order.append(defender)
+                else:
+                    # 无法解析目标，退回到直接追踪
+                    chase_target(defender, target)
             else:
+                # 没有分配目标，清除标记并停在原地
+                try:
+                    defender._assigned_target = None
+                except Exception:
+                    pass
                 defender.set_velocity([0.0, 0.0, 0.0])
+
+        # 如果提供了地图，则调用 CBS 进行批量路径规划（返回世界坐标路径列表）
+        if map_grid is not None and pairs:
+            try:
+                from algorithms.cbs_pathplan import cbs_plan_paths
+                # 调用 cbs，输入为 (start_obj, goal_world_pos) 二元组列表
+                plan_inputs = [(p[0], p[1]) for p in pairs]
+                world_paths = cbs_plan_paths(plan_inputs, map_grid=map_grid)
+            except Exception:
+                world_paths = []
+
+            if world_paths:
+                # 对于每个防守方，取路径的第二个点（第一点通常是起点）作为下一步航点
+                for defender, path in zip(defenders_order, world_paths):
+                    if path and len(path) >= 2:
+                        next_wp = path[1]
+                        # next_wp 是 [x,y,z]
+                        chase_point(defender, next_wp)
+                        # 将整条路径缓存到 defender 上，供后续可能使用（非必需）
+                        try:
+                            defender._cbs_path = path
+                            defender._cbs_goal = path[-1]
+                        except Exception:
+                            pass
+                    elif path and len(path) == 1:
+                        chase_point(defender, path[0])
+                    else:
+                        # 路径为空，退化为直接追踪目标对象
+                        target_obj = assignment.get(defender.name)
+                        if target_obj is not None:
+                            chase_target(defender, target_obj)
+            else:
+                # CBS 未返回有效路径，退化为直接追踪
+                for def_name, target in assignment.items():
+                    defender = name_to_defender.get(def_name)
+                    if defender is None:
+                        continue
+                    if target is not None:
+                        chase_target(defender, target)
+                    else:
+                        defender.set_velocity([0.0, 0.0, 0.0])
+        else:
+            # 没有 map_grid，则保持原有行为：直接追踪
+            for def_name, target in assignment.items():
+                defender = name_to_defender.get(def_name)
+                if defender is None:
+                    continue
+                if target is not None:
+                    chase_target(defender, target)
+                else:
+                    defender.set_velocity([0.0, 0.0, 0.0])
     elif defensive:
         # 没有进攻方时，防守方停止移动
         for defender in defensive:
@@ -100,9 +215,11 @@ def update_chase_strategy(drones, offensive_target_point, assignment_cfg=None):
 def spawn_random_drone(config: dict, drones: list) -> None:
     #根据当前进攻方无人机数量随机生成1~2架新的进攻方无人机, 生成位置在地图左侧(-450~450, -400~400, 100), 类型随机为attack或tank
     offensive = [d for d in drones if _is_offensive(d) and d.is_alive()]
-    if len(offensive) >= 10:
+    max_offensive = int(config.get("simulation", {}).get("max_offensive", 6))
+    if len(offensive) >= max_offensive:
         return
-    for _ in range(random.randint(1, 2)):
+    # 小规模仿真默认每次仅生成 1 架
+    for _ in range(random.randint(1, 1)):
         drone_type = random.choice(["attack", "tank"])
         if drone_type in {"attack", "tank"}:
             position = [random.uniform(-450, 450), random.uniform(-400, 400), 100]
@@ -173,6 +290,12 @@ def run_simulation(config: dict):
         try:
             display = Open3DDisplay(map_size=(config["map"]["width"], config["map"]["height"]))
             display.open_window()
+            # 提前初始化地图数据，使 display.map_grid 在仿真第一帧就可用
+            try:
+                display._init_map_data()
+            except Exception:
+                # 若初始化失败（应当不会），在后续 display.update() 时会再次尝试
+                pass
         except Exception as exc:
             LOGGER.warning("Open3D initialization failed, running headless: %s", exc)
             display = None
@@ -182,7 +305,10 @@ def run_simulation(config: dict):
     frame_time = 1.0 / fps
     start_time = time.time()
     duration = config["simulation"]["duration"]
-    next_spawn_time = random.uniform(1.0, 3.0)
+    # 生成间隔支持从配置读取，便于做小规模仿真
+    spawn_min = config.get("simulation", {}).get("spawn_interval_min", 1.0)
+    spawn_max = config.get("simulation", {}).get("spawn_interval_max", 3.0)
+    next_spawn_time = random.uniform(spawn_min, spawn_max)
     spawn_timer = 0.0
     base_position = config["base"]["position"]   # 例如 [0, 0, 0]
 
@@ -226,7 +352,8 @@ def run_simulation(config: dict):
                 break
 
             #6. 更新存活无人机的追逐策略
-            update_chase_strategy(alive_drones, base_position, _ASSIGNMENT_CONFIG) #进攻方的目标点暂时设定为基地位置
+            # 将 display.map_grid 传入路径规划模块；若 display 不存在则传入 None
+            update_chase_strategy(alive_drones, base_position, _ASSIGNMENT_CONFIG, map_grid=(display.map_grid if display is not None else None)) #进攻方的目标点暂时设定为基地位置
             # 更新每架无人机的追逐策略 """
 
             #7. 更新存活无人机的位置
@@ -243,7 +370,7 @@ def run_simulation(config: dict):
             spawn_timer += frame_time  #随机生成进攻方无人机
             if spawn_timer >= next_spawn_time:
                 spawn_timer = 0.0
-                next_spawn_time = random.uniform(1.0, 3.0)
+                next_spawn_time = random.uniform(spawn_min, spawn_max)
                 if random.random() < 0.9:
                     spawn_random_drone(config, drones)
 

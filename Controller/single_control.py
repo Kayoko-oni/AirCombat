@@ -4,6 +4,19 @@ from typing import List
 
 from drones.base_drone import BaseDrone
 from utils.geometry import clamp_position
+import time
+from typing import Optional
+
+# 使用算法模块提供的轻量 A* 与视线检测工具
+try:
+    from algorithms.cbs_pathplan import a_star_plan_world, line_of_sight_world
+except Exception:
+    a_star_plan_world = None
+    line_of_sight_world = None
+try:
+    from algorithms.path_tracker import PathTracker
+except Exception:
+    PathTracker = None
 
 
 def move_drone(drone: BaseDrone, delta_time: float) -> None:
@@ -29,17 +42,18 @@ def set_speed(drone: BaseDrone, velocity: Tuple[float, float, float]) -> None:
     #调用目标无人机的成员函数.set_velocity
 
 
-def chase_target(drone: BaseDrone, target: BaseDrone) -> None:
-    """让无人机朝向目标无人机的位置追踪。参数：要操控的无人机实例 想要追踪的无人机实例"""
+def chase_target(drone: BaseDrone, target: BaseDrone, map_grid: Optional[object] = None) -> None:
+    """让无人机朝向目标无人机的位置追踪。若提供 map_grid，则会尝试避障。
+
+    参数：
+    - drone: 被控制的无人机实例
+    - target: 目标无人机实例（要求有 `.position`）
+    - map_grid: 可选的 `MapGrid` 实例；若提供且可用，则会尝试基于 A* 规划并缓存路径
+    """
     if not drone.is_alive() or not target.is_alive():
         return
-    direction = [t - p for t, p in zip(target.position, drone.position)]
-    distance = math.sqrt(sum(v * v for v in direction))
-    if distance < 1e-3:
-        return
-    normalized = [v / distance for v in direction]
-    velocity = [normalized[i] * drone.max_speed for i in range(3)]
-    drone.set_velocity(velocity)
+    target_pos = tuple(target.position[:3])
+    chase_point(drone, target_pos, map_grid=map_grid)
     #如果追踪方与被追踪方 有一方已经坠毁, 则直接返回, 不进行追踪
     #计算追踪方位置指向被追踪方位置的方向向量direction
     #计算direction的模长, 即为二者之间的距离distance
@@ -48,14 +62,43 @@ def chase_target(drone: BaseDrone, target: BaseDrone) -> None:
     #将单位方向向量normalized乘上无人机的最大速度.max_speed, 得到无人机的最大速度向量velocity
     #将无人机的速度设置为最大速度向量velocity, 无人机将沿着这个速度向量的方向运动
 
-def chase_point(drone: BaseDrone, target_point: List[float]) -> None:
-    """让无人机朝向固定点追踪。参数：要操控的无人机实例 目标点的坐标列表 """
+def chase_point(drone: BaseDrone, target_point: List[float], map_grid: Optional[object] = None) -> None:
+    """让无人机朝向固定点追踪。若提供 map_grid，则使用 PathTracker（若可用）进行按需重规划和路径缓存。
+    """
     if not drone.is_alive():
         return
-    direction = [t - p for t, p in zip(target_point, drone.position)]
-    distance = math.sqrt(sum(v * v for v in direction)) 
-    if distance < 1e-3:
+
+    # 直接速度设置函数
+    def _set_velocity_towards(dr: BaseDrone, pt: List[float]):
+        direction = [t - p for t, p in zip(pt, dr.position)]
+        distance = math.sqrt(sum(v * v for v in direction))
+        if distance < 1e-3:
+            return
+        normalized = [v / distance for v in direction]
+        velocity = [normalized[i] * dr.max_speed for i in range(3)]
+        dr.set_velocity(velocity)
+
+    # 如果没有地图或 PathTracker 不可用，退化为原直线追踪
+    if map_grid is None or PathTracker is None:
+        _set_velocity_towards(drone, target_point)
         return
-    normalized = [v / distance for v in direction]
-    velocity = [normalized[i] * drone.max_speed for i in range(3)]
-    drone.set_velocity(velocity)
+
+    # 获取或创建跟踪器
+    if not hasattr(drone, "_path_tracker") or drone._path_tracker is None:
+        try:
+            drone._path_tracker = PathTracker(drone)
+        except Exception:
+            drone._path_tracker = None
+
+    tracker = getattr(drone, "_path_tracker", None)
+    if tracker is None:
+        _set_velocity_towards(drone, target_point)
+        return
+
+    next_wp = tracker.update(tuple(target_point[:3]), map_grid)
+    if next_wp is None:
+        # 目标可直达或规划失败 -> 直接追踪目标点
+        _set_velocity_towards(drone, target_point)
+    else:
+        # 追踪下一个航点
+        _set_velocity_towards(drone, next_wp)

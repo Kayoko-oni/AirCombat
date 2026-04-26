@@ -60,3 +60,14 @@ class MapGrid:
                 if not self.is_grid_occupied(nx, ny):
                     neighbors.append((nx, ny))
         return neighbors
+
+    def grid_to_world(self, gx: int, gy: int) -> Tuple[float, float]:
+        """将网格索引转换为该网格中心点的世界坐标（x, y）。
+
+        注意：不包含高度(z)，路径规划器在需要时可用无人机的当前z作为高度。
+        """
+        # 网格左下角世界坐标 = (min_x, min_y)
+        # 网格中心 = 左下角 + (gx + 0.5) * cell_size
+        x = self.min_x + (gx + 0.5) * self.cell_size
+        y = self.min_y + (gy + 0.5) * self.cell_size
+        return x, y

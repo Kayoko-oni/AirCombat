@@ -5,7 +5,7 @@ import yaml
 
 from utils.map_loader import generate_buildings
 from drones.base_drone import BaseDrone
-from Visual.render_utils import create_drone_mesh, create_path_line, create_explosion_mesh, create_drone_model_mesh, create_guts_base_mesh
+from Visual.render_utils import create_drone_mesh, create_path_line, create_explosion_mesh, create_drone_model_mesh, create_guts_base_mesh, create_dashed_line
 
 
 class Open3DDisplay:
@@ -258,6 +258,41 @@ class Open3DDisplay:
                     material_trail.base_color = trail_color + (1.0,)
                     self.scene_widget.scene.add_geometry(f"trail_{drone.name}", path, material_trail)
                     self.dynamic_geometries.add(f"trail_{drone.name}")
+            # 如果存在避障路径缓存（来自 PathTracker 或 CBS），可视化显示
+            # 优先显示防守方的 CBS 路径 (_cbs_path)（红色），其次显示个人避障路径 (_avoid_path)（绿色）
+            try:
+                if hasattr(drone, "_cbs_path") and drone._cbs_path:
+                    # 使用不那么刺眼的紫色来区分于进攻方轨迹（红色）
+                    p = create_path_line(drone._cbs_path, color=(0.6, 0.2, 0.8))
+                    if p is not None:
+                        material_p = self.rendering.MaterialRecord()
+                        material_p.shader = 'unlitLine'
+                        material_p.base_color = (0.6, 0.2, 0.8, 1.0)
+                        self.scene_widget.scene.add_geometry(f"path_{drone.name}", p, material_p)
+                        self.dynamic_geometries.add(f"path_{drone.name}")
+                elif hasattr(drone, "_avoid_path") and drone._avoid_path:
+                    p = create_path_line(drone._avoid_path, color=(0.2, 0.8, 0.2))
+                    if p is not None:
+                        material_p = self.rendering.MaterialRecord()
+                        material_p.shader = 'unlitLine'
+                        material_p.base_color = (0.2, 0.8, 0.2, 1.0)
+                        self.scene_widget.scene.add_geometry(f"path_{drone.name}", p, material_p)
+                        self.dynamic_geometries.add(f"path_{drone.name}")
+            except Exception:
+                pass
+            # 显示防守分配连线：若 defender 有 `_assigned_target` 属性，则用虚线显示到目标
+            try:
+                assigned = getattr(drone, "_assigned_target", None)
+                if assigned is not None and hasattr(assigned, "position") and getattr(assigned, "is_alive", lambda: True)():
+                    dash = create_dashed_line(drone.position, assigned.position, color=(1.0, 0.8, 0.0))
+                    if dash is not None:
+                        material_assign = self.rendering.MaterialRecord()
+                        material_assign.shader = 'unlitLine'
+                        material_assign.base_color = (1.0, 0.8, 0.0, 1.0)
+                        self.scene_widget.scene.add_geometry(f"assign_{drone.name}", dash, material_assign)
+                        self.dynamic_geometries.add(f"assign_{drone.name}")
+            except Exception:
+                pass
             enemies = defensive if drone in offensive else offensive
             nearest_dist = self._nearest_enemy_distance(drone, enemies)
             # Removed 3D label for each drone to reduce clutter
