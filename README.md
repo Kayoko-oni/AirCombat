@@ -310,3 +310,193 @@ drones:        # 四种机型详细配置
 - **数据持久化**：`data/` 中的 JSON 文件可实现日志保存
 
 这个框架提供了完整的无人机仿真基础，可以根据需求逐步添加高级功能。
+
+
+
+
+## 📅 4/26 更新：网格避障 + CBS 多机路径规划
+
+### 一、地图网格系统 (`utils/map_grid.py`)
+
+将城市建筑转换为统一的障碍物网格，供路径规划查询。
+
+**网格参数**：201×201，分辨率 5 米/格，覆盖 [-500, 500] 米范围。
+
+| 方法 | 说明 |
+|------|------|
+| `world_to_grid(x, y)` | 世界坐标 → 网格索引 `(gx, gy)` |
+| `grid_to_world(gx, gy)` | 网格索引 → 中心点世界坐标 |
+| `is_occupied(x, y)` | 判断世界坐标是否被建筑占据 |
+| `is_grid_occupied(gx, gy)` | 判断网格是否被占据 |
+| `get_neighbors(gx, gy)` | 返回上下左右可通行邻居（已过滤边界和障碍） |
+| `width, height` | 网格尺寸属性（均为 201） |
+
+**建筑生成** (`utils/map_loader.py`)：支持 `avoid_overlap` 防重叠、`padding` 间距、`max_attempts` 重试。
+
+---
+
+### 二、路径规划算法 (`algorithms/cbs_pathplan.py`)
+
+#### 2.1 单体 A* 规划
+
+```python
+def a_star_plan_world(start, goal, map_grid, max_time_ms=50) -> List[Tuple]
+```
+
+- 八连通邻居（含对角），欧氏距离启发
+- 超时保护，返回世界坐标路径（已平滑）
+
+#### 2.2 视线检测
+
+```python
+def line_of_sight_world(start, goal, map_grid) -> bool
+```
+
+- Bresenham 直线算法，判断 XY 平面是否被建筑阻挡
+
+#### 2.3 CBS 多机规划
+
+```python
+def cbs_plan_paths(agent_pairs, map_grid, time_limit_ms=200, max_agents=8) -> List[List]
+```
+
+- 输入：`[(start, goal), ...]` 或 `[(drone_obj, goal), ...]`
+- 仅规划 XY 二维（Z 不变），点冲突检测，返回无冲突路径集
+
+---
+
+### 三、路径跟踪器 (`algorithms/path_tracker.py`)
+
+管理单机的路径缓存与按需重规划。
+
+```python
+class PathTracker:
+    def __init__(self, map_grid, config)
+    def update(self, current_pos, goal_pos, current_time) -> Optional[Vector3D]
+```
+
+**配置项**：
+
+| 参数 | 说明 |
+|------|------|
+| `replan_distance` | 目标移动超过该距离才重规划 |
+| `replan_cooldown` | 重规划最小间隔（秒） |
+| `max_plan_time_ms` | 单次 A* 最大耗时 |
+| `path_tolerance` | 路径点跳过容差 |
+| `debug_log` | 是否输出规划日志 |
+
+**逻辑**：视线可达则直飞 → 否则 A* 规划 → 缓存路径 → 返回下一航点
+
+---
+
+### 四、控制器集成 (`Controller/single_control.py`)
+
+```python
+def chase_target(drone, enemies, dt, map_grid=None, tracker=None, current_time=0)
+def chase_point(drone, target_pos, dt, map_grid=None, tracker=None, current_time=0)
+```
+
+- 有 `map_grid` 时使用 `PathTracker` 实现避障
+- 无地图或规划失败时退化为直线追逐
+
+---
+
+### 五、主程序集成 (`main.py`)
+
+```python
+update_chase_strategy(drones, target_point, assignment_cfg=None, map_grid=None)
+```
+
+- 在仿真循环中传入 `display.map_grid`
+- 进攻方：目标不可直达时调用 A* 绕行
+- 防守方：调用 CBS 规划集体路径
+
+**生成控制**：
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `max_offensive` | 6 | 最大进攻方数量 |
+| `spawn_interval_min` | 5.0 | 最小生成间隔（秒） |
+| `spawn_interval_max` | 12.0 | 最大生成间隔（秒） |
+
+---
+
+### 六、可视化增强 (`Visual/`)
+
+| 类型 | 颜色/样式 | 对应属性 |
+|------|----------|----------|
+| 进攻方避障路径 | 绿色 | `drone._avoid_path` |
+| 防守方 CBS 路径 | 紫色 | `drone._cbs_path` |
+| 防守方→目标连线 | 黄色虚线 | `create_dashed_line()` |
+| 历史轨迹 | 红色 | 原有轨迹线 |
+
+**虚线工具**：
+
+```python
+def create_dashed_line(p1, p2, color, dash_length=0.3, gap_length=0.2)
+```
+
+---
+
+### 七、配置文件 (`config.yaml`)
+
+```yaml
+path_planning:
+  replan_distance: 5.0
+  replan_cooldown: 0.5
+  max_plan_time_ms: 50
+  path_tolerance: 0.5
+  debug_log: false
+
+simulation:
+  max_offensive: 6
+  spawn_interval_min: 5.0
+  spawn_interval_max: 12.0
+
+map:
+  buildings:
+    avoid_overlap: true
+    padding: 2.5
+```
+
+---
+
+### 八、工具脚本 (`tools/`)
+
+| 脚本 | 用途 |
+|------|------|
+| `cbs_perf_test.py` | 测试不同无人机数量下的 CBS 耗时与成功率 |
+| `map_grid_check.py` | 检查建筑重叠、网格占据情况 |
+
+---
+
+## 原版功能（保持不变）
+
+- **无人机类型**：攻击机、肉盾机（红方）；侦察机、拦截机（蓝方）
+- **控制模块**：移动、边界检查、碰撞检测
+- **感知模块**：雷达探测
+- **可视化**：Open3D 实时渲染，鼠标拖拽/滚轮/右键重置
+
+---
+
+## 运行方式
+
+```bash
+# 可视化仿真
+python main.py
+
+# 无头测试
+python remark/test.py --duration 10 --offensive-count 4 --defensive-count 4
+
+# 网格检查
+python tools/map_grid_check.py
+
+# 性能测试
+python tools/cbs_perf_test.py --agents 1 2 4 6
+```
+
+---
+
+## 配置调整
+
+编辑 `config.yaml` 修改地图尺寸、无人机属性、路径规划参数、生成频率等。
