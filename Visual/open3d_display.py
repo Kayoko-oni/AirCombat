@@ -43,6 +43,7 @@ class Open3DDisplay:
         self.is_open = True
         self.paused = False
 
+        self.show_paths = False   # True=显示避障路径, False=不显示
         self.static_objects_added = False      # 静态物体是否已添加
         self.dynamic_geometries = set()        # 存储动态几何体的名称
         self.map_initialized = False           # 地图是否已初始化（用于首次更新时添加建筑）
@@ -147,12 +148,12 @@ class Open3DDisplay:
             sx, sy, sz = size
             box = self.o3d.geometry.TriangleMesh.create_box(width=sx, height=sy, depth=sz)
             box.translate([cx - sx/2, cy - sy/2, cz - sz/2])
-            box.paint_uniform_color((0.5, 0.5, 0.5))
+            box.paint_uniform_color((0.8, 0.8, 0.8))
             combined += box
         combined.compute_vertex_normals()
         material = self.rendering.MaterialRecord()
         material.shader = 'defaultLit'
-        material.base_color = (0.5, 0.5, 0.5, 0.8)
+        material.base_color = (0.8, 0.8, 0.8, 0.92)
         self.scene_widget.scene.add_geometry("city_buildings", combined, material)
         print(f"Buildings displayed: {len(self.buildings)}")
 
@@ -260,26 +261,27 @@ class Open3DDisplay:
                     self.dynamic_geometries.add(f"trail_{drone.name}")
             # 如果存在避障路径缓存（来自 PathTracker 或 CBS），可视化显示
             # 优先显示防守方的 CBS 路径 (_cbs_path)（红色），其次显示个人避障路径 (_avoid_path)（绿色）
-            try:
-                if hasattr(drone, "_cbs_path") and drone._cbs_path:
-                    # 使用不那么刺眼的紫色来区分于进攻方轨迹（红色）
-                    p = create_path_line(drone._cbs_path, color=(0.6, 0.2, 0.8))
-                    if p is not None:
-                        material_p = self.rendering.MaterialRecord()
-                        material_p.shader = 'unlitLine'
-                        material_p.base_color = (0.6, 0.2, 0.8, 1.0)
-                        self.scene_widget.scene.add_geometry(f"path_{drone.name}", p, material_p)
-                        self.dynamic_geometries.add(f"path_{drone.name}")
-                elif hasattr(drone, "_avoid_path") and drone._avoid_path:
-                    p = create_path_line(drone._avoid_path, color=(0.2, 0.8, 0.2))
-                    if p is not None:
-                        material_p = self.rendering.MaterialRecord()
-                        material_p.shader = 'unlitLine'
-                        material_p.base_color = (0.2, 0.8, 0.2, 1.0)
-                        self.scene_widget.scene.add_geometry(f"path_{drone.name}", p, material_p)
-                        self.dynamic_geometries.add(f"path_{drone.name}")
-            except Exception:
-                pass
+            if self.show_paths:
+                try:
+                    if hasattr(drone, "_cbs_path") and drone._cbs_path:
+                        # 使用不那么刺眼的紫色来区分于进攻方轨迹（红色）
+                        p = create_path_line(drone._cbs_path, color=(0.6, 0.2, 0.8))
+                        if p is not None:
+                            material_p = self.rendering.MaterialRecord()
+                            material_p.shader = 'unlitLine'
+                            material_p.base_color = (0.6, 0.2, 0.8, 1.0)
+                            self.scene_widget.scene.add_geometry(f"path_{drone.name}", p, material_p)
+                            self.dynamic_geometries.add(f"path_{drone.name}")
+                    elif hasattr(drone, "_avoid_path") and drone._avoid_path:
+                        p = create_path_line(drone._avoid_path, color=(0.2, 0.8, 0.2))
+                        if p is not None:
+                            material_p = self.rendering.MaterialRecord()
+                            material_p.shader = 'unlitLine'
+                            material_p.base_color = (0.2, 0.8, 0.2, 1.0)
+                            self.scene_widget.scene.add_geometry(f"path_{drone.name}", p, material_p)
+                            self.dynamic_geometries.add(f"path_{drone.name}")
+                except Exception:
+                    pass
             # 显示防守分配连线：若 defender 有 `_assigned_target` 属性，则用虚线显示到目标
             try:
                 assigned = getattr(drone, "_assigned_target", None)
