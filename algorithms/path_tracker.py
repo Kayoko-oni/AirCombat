@@ -35,12 +35,15 @@ class PathTracker:
         self.idx = 0
         self.goal: Optional[Tuple[float, float, float]] = None
         self.last_replan = 0.0
+        self.climb_active = False
+        self.climb_target_z: Optional[float] = None
         # load defaults
         self.replan_distance = 1.0  # 米，目标变化超过此距离将触发重规划
         self.replan_cooldown = 0.5  # 秒，最小重规划间隔
         self.max_plan_time_ms = 50  # 毫秒
         self.path_tolerance = 1.0   # 米，小于此认为到达路径点
         self.debug_log = False
+        self.climb_clearance = 5.0  # 米，爬升时需高出障碍的安全高度
         # 尝试读取配置文件
         try:
             cfg_path = Path(config_path) if config_path else Path(__file__).resolve().parents[1] / "config.yaml"
@@ -53,6 +56,7 @@ class PathTracker:
                     self.max_plan_time_ms = int(pp.get("max_plan_time_ms", self.max_plan_time_ms))
                     self.path_tolerance = float(pp.get("path_tolerance", self.path_tolerance))
                     self.debug_log = bool(pp.get("debug_log", self.debug_log))
+                    self.climb_clearance = float(pp.get("climb_clearance", self.climb_clearance))
         except Exception as exc:
             logger.warning("Failed to load path planning config: %s", exc)
 
@@ -68,16 +72,34 @@ class PathTracker:
         goal = (float(goal_world[0]), float(goal_world[1]), float(goal_world[2] if len(goal_world) > 2 else 0.0))
         pos = tuple(self.drone.position[:3])
 
-        # 如果直线可达则不用规划
+        # 先检查沿线最高建筑高度：若双方已经在安全高度之上则认为可直达
+        maxh = 0.0
         try:
-            if line_of_sight_world(pos, goal, map_grid):
-                # 清除缓存
+            if hasattr(map_grid, "max_height_along_line"):
+                maxh = map_grid.max_height_along_line(pos, goal)
+        except Exception:
+            maxh = 0.0
+
+        # 如果双方都在障碍之上并满足安全间隙，则认为视线可达
+        try:
+            if pos[2] > maxh + self.climb_clearance and goal[2] > maxh + self.climb_clearance:
                 self.path = None
                 self.goal = None
+                self.climb_active = False
                 return None
         except Exception:
-            # 若视线检测异常，退回不规划
-            return None
+            pass
+
+        # 如果正在爬升阶段，则优先继续爬升
+        if self.climb_active:
+            current_z = float(self.drone.position[2])
+            if abs(current_z - (self.climb_target_z or 0.0)) < 1.0:
+                # 已达到爬升高度，结束爬升阶段，下一次循环会重试直接或规划路径
+                self.climb_active = False
+                self.climb_target_z = None
+            else:
+                # 继续爬升：返回垂直上升目标点
+                return [float(pos[0]), float(pos[1]), float(self.climb_target_z)]
 
         need_replan = False
         if self.goal is None:
@@ -106,6 +128,33 @@ class PathTracker:
             if self.path is not None and self.idx < len(self.path):
                 return self.path[self.idx]
             return None
+
+        # 如果视线被阻挡且高度不足，尝试触发爬升避障（简单处理）
+        try:
+            los = False
+            try:
+                los = line_of_sight_world(pos, goal, map_grid)
+            except Exception:
+                los = False
+
+            if not los:
+                maxh = 0.0
+                if hasattr(map_grid, "max_height_along_line"):
+                    maxh = map_grid.max_height_along_line(pos, goal)
+                # 如果当前高度低于障碍顶端 + 安全间隙，则先爬升
+                if pos[2] <= maxh + self.climb_clearance:
+                    climb_z = float(maxh + self.climb_clearance + 1.0)
+                    self.climb_active = True
+                    self.climb_target_z = climb_z
+                    try:
+                        self.drone._avoid_path = [[float(pos[0]), float(pos[1]), float(pos[2])], [float(pos[0]), float(pos[1]), climb_z]]
+                    except Exception:
+                        pass
+                    self.last_replan = now
+                    return [float(pos[0]), float(pos[1]), climb_z]
+        except Exception:
+            # 任何异常都不应阻塞正常逻辑
+            pass
 
         # 执行 A* 规划
         t0 = time.time()

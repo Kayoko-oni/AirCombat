@@ -42,6 +42,8 @@ path_planning:
   max_plan_time_ms: 50     # 毫秒，单次 A* 规划的时间上限
   path_tolerance: 1.0       # 米，认为已到达路径点的容差
   debug_log: false          # 是否记录重规划日志到 stdout
+  # 爬升避障相关（当地面路径被高楼阻挡时，先爬升再继续）
+  climb_clearance: 5.0      # 米，爬升到障碍顶端之上所需最小安全距离
 
 assignment:
   # 改进拍卖 + CMA 动态分配参数（默认调优版，可在此直接调参）
