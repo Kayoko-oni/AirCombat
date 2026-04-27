@@ -26,6 +26,8 @@ from Controller.single_control import chase_point, chase_target, move_drone
 from base.base_manager import BaseManager
 from algorithms.auction_assign import ImprovedAuctionConfig, greedy_assignment
 from algorithms.cbs_pathplan import cbs_plan_paths
+from utils.map_loader import generate_buildings
+from utils.map_grid import MapGrid
 from drones.factory import (
     create_attack_drone,
     create_drone_team,
@@ -51,6 +53,12 @@ def build_assignment_config(config: Dict[str, Any]) -> ImprovedAuctionConfig:
     valid_keys = {item.name for item in fields(ImprovedAuctionConfig)}
     kwargs = {key: raw[key] for key in valid_keys if key in raw}
     return ImprovedAuctionConfig(**kwargs)
+
+
+def build_map_grid(config: Dict[str, Any]) -> MapGrid:
+    """Build obstacle map data in the same style as main simulation."""
+    buildings = generate_buildings(config=config)
+    return MapGrid(buildings, cell_size=5.0)
 
 
 def spawn_random_drone(config: Dict[str, Any], drones: List[Any], max_offensive: int = 80) -> None:
@@ -122,32 +130,99 @@ def update_strategy_and_measure(
     alive_drones: List[Any],
     base_position: List[float],
     assignment_cfg: ImprovedAuctionConfig,
+    map_grid: Optional[MapGrid],
+    cbs_eval_max_agents: int,
+    enable_pathplan: bool,
 ) -> Dict[str, float]:
     offensive = [d for d in alive_drones if is_offensive(d) and d.is_alive()]
     defensive = [d for d in alive_drones if not is_offensive(d) and d.is_alive()]
 
     for drone in offensive:
-        chase_point(drone, base_position)
+        chase_point(drone, base_position, map_grid=map_grid)
 
     assignment_cost_ms = 0.0
+    pathplan_cost_ms = 0.0
+    pathplan_calls = 0
+    pathplan_agents = 0
+    pathplan_success = 0
     assigned_pairs = 0
     if offensive and defensive:
         t0 = time.perf_counter()
         assignment = greedy_assignment(defensive, offensive, config=assignment_cfg)
         assignment_cost_ms = (time.perf_counter() - t0) * 1000.0
-        for defender in defensive:
-            target = assignment.get(defender.name)
-            if target is not None:
-                chase_target(defender, target)
-                assigned_pairs += 1
-            else:
+
+        defenders_by_name = {d.name: d for d in defensive}
+        plan_inputs = []
+        defenders_order = []
+
+        for def_name, target in assignment.items():
+            defender = defenders_by_name.get(def_name)
+            if defender is None:
+                continue
+            if target is None:
                 defender.set_velocity([0.0, 0.0, 0.0])
+                continue
+
+            assigned_pairs += 1
+            goal = target.position if hasattr(target, "position") else None
+            if goal is None:
+                chase_target(defender, target, map_grid=map_grid)
+                continue
+            plan_inputs.append((defender, goal))
+            defenders_order.append(defender)
+
+        if map_grid is not None and plan_inputs and cbs_eval_max_agents > 0 and enable_pathplan:
+            capped_inputs = plan_inputs[:cbs_eval_max_agents]
+            capped_defenders = defenders_order[:cbs_eval_max_agents]
+            fallback_defenders = defenders_order[cbs_eval_max_agents:]
+
+            pathplan_calls = 1
+            pathplan_agents = len(capped_inputs)
+            t1 = time.perf_counter()
+            world_paths = cbs_plan_paths(
+                capped_inputs,
+                map_grid=map_grid,
+                max_agents=max(cbs_eval_max_agents, 1),
+            )
+            pathplan_cost_ms = (time.perf_counter() - t1) * 1000.0
+
+            if world_paths:
+                for defender, path in zip(capped_defenders, world_paths):
+                    if path and len(path) >= 2:
+                        chase_point(defender, path[1])
+                        pathplan_success += 1
+                    elif path and len(path) == 1:
+                        chase_point(defender, path[0])
+                        pathplan_success += 1
+                    else:
+                        target = assignment.get(defender.name)
+                        if target is not None:
+                            chase_target(defender, target, map_grid=map_grid)
+            else:
+                for defender in capped_defenders:
+                    target = assignment.get(defender.name)
+                    if target is not None:
+                        chase_target(defender, target, map_grid=map_grid)
+
+            for defender in fallback_defenders:
+                target = assignment.get(defender.name)
+                if target is not None:
+                    chase_target(defender, target, map_grid=map_grid)
+        else:
+            for defender in defenders_order:
+                target = assignment.get(defender.name)
+                if target is not None:
+                    chase_target(defender, target, map_grid=map_grid)
     else:
         for defender in defensive:
             defender.set_velocity([0.0, 0.0, 0.0])
 
     return {
         "assignment_ms": assignment_cost_ms,
+        "pathplan_ms": pathplan_cost_ms,
+        "pathplan_calls": float(pathplan_calls),
+        "pathplan_agents": float(pathplan_agents),
+        "pathplan_success": float(pathplan_success),
         "assigned_pairs": float(assigned_pairs),
     }
 
@@ -161,6 +236,9 @@ def evaluate_once(
     offensive_count: int,
     defensive_count: int,
     silent_events: bool,
+    cbs_eval_max_agents: int,
+    strategy_interval_frames: int,
+    pathplan_interval_frames: int,
 ) -> Dict[str, Any]:
     if seed is not None:
         random.seed(seed)
@@ -169,6 +247,7 @@ def evaluate_once(
     bootstrap_large_swarm(config, drones, offensive_count, defensive_count)
     base_manager = BaseManager(config)
     assignment_cfg = build_assignment_config(config)
+    map_grid = build_map_grid(config)
 
     frame_time = 1.0 / max(fps, 1)
     max_frames = int(duration_s * fps) if duration_s > 0 else 3000
@@ -183,12 +262,17 @@ def evaluate_once(
     pathplan_costs_ms: List[float] = []
     assignment_call_count = 0
     pathplan_call_count = 0
+    pathplan_total_agents = 0.0
+    pathplan_total_success = 0.0
     total_assigned_pairs = 0.0
 
     episode_start = time.perf_counter()
 
     simulated_seconds = 0.0
-    for _ in range(max_frames):
+    strategy_interval_frames = max(1, int(strategy_interval_frames))
+    pathplan_interval_frames = max(1, int(pathplan_interval_frames))
+
+    for frame_idx in range(max_frames):
         if base_manager.is_destroyed():
             break
 
@@ -216,20 +300,24 @@ def evaluate_once(
         if not alive_drones:
             break
 
-        strategy_metrics = update_strategy_and_measure(
-            alive_drones=alive_drones,
-            base_position=config["base"]["position"],
-            assignment_cfg=assignment_cfg,
-        )
-        if strategy_metrics["assignment_ms"] > 0:
-            assignment_call_count += 1
-            assignment_costs_ms.append(strategy_metrics["assignment_ms"])
-        total_assigned_pairs += strategy_metrics["assigned_pairs"]
-
-        t0 = time.perf_counter()
-        _ = cbs_plan_paths(alive_drones)
-        pathplan_costs_ms.append((time.perf_counter() - t0) * 1000.0)
-        pathplan_call_count += 1
+        if frame_idx % strategy_interval_frames == 0:
+            strategy_metrics = update_strategy_and_measure(
+                alive_drones=alive_drones,
+                base_position=config["base"]["position"],
+                assignment_cfg=assignment_cfg,
+                map_grid=map_grid,
+                cbs_eval_max_agents=cbs_eval_max_agents,
+                enable_pathplan=(frame_idx % pathplan_interval_frames == 0),
+            )
+            if strategy_metrics["assignment_ms"] > 0:
+                assignment_call_count += 1
+                assignment_costs_ms.append(strategy_metrics["assignment_ms"])
+            if strategy_metrics["pathplan_calls"] > 0:
+                pathplan_call_count += int(strategy_metrics["pathplan_calls"])
+                pathplan_costs_ms.append(strategy_metrics["pathplan_ms"])
+                pathplan_total_agents += strategy_metrics["pathplan_agents"]
+                pathplan_total_success += strategy_metrics["pathplan_success"]
+            total_assigned_pairs += strategy_metrics["assigned_pairs"]
 
         for drone in alive_drones:
             move_drone(drone, frame_time)
@@ -273,6 +361,12 @@ def evaluate_once(
         "pathplan_calls": pathplan_call_count,
         "pathplan_avg_ms": mean(pathplan_costs_ms) if pathplan_costs_ms else 0.0,
         "pathplan_max_ms": max(pathplan_costs_ms) if pathplan_costs_ms else 0.0,
+        "pathplan_avg_agents": (
+            pathplan_total_agents / max(pathplan_call_count, 1)
+        ),
+        "pathplan_success_rate": (
+            pathplan_total_success / max(pathplan_total_agents, 1.0)
+        ),
         "avg_assigned_pairs_per_frame": (
             total_assigned_pairs / max(pathplan_call_count, 1)
         ),
@@ -304,6 +398,8 @@ def aggregate_results(runs: List[Dict[str, Any]]) -> Dict[str, Any]:
         "pathplan_calls",
         "pathplan_avg_ms",
         "pathplan_max_ms",
+        "pathplan_avg_agents",
+        "pathplan_success_rate",
         "avg_assigned_pairs_per_frame",
     ]
 
@@ -330,7 +426,8 @@ def print_run(idx: int, result: Dict[str, Any]) -> None:
         f"[Run {idx}] winner={result['winner']}, runtime={result['runtime_seconds']:.3f}s, "
         f"base={result['base_health']:.1f}, shot_down={result['attackers_shot_down']}, "
         f"lost={result['defenders_lost']}, assign_avg={result['assignment_avg_ms']:.4f}ms, "
-        f"path_avg={result['pathplan_avg_ms']:.4f}ms"
+        f"path_avg={result['pathplan_avg_ms']:.4f}ms, "
+        f"path_success={result['pathplan_success_rate']*100.0:.1f}%"
     )
 
 
@@ -347,6 +444,9 @@ def run_evaluation(
     offensive_count: int,
     defensive_count: int,
     silent_events: bool,
+    cbs_eval_max_agents: int,
+    strategy_interval_frames: int,
+    pathplan_interval_frames: int,
 ) -> Path:
     config_path = Path(config).resolve()
     if not config_path.exists():
@@ -358,6 +458,7 @@ def run_evaluation(
     for i in range(runs):
         run_config = copy.deepcopy(base_config)
         run_seed = seed + i
+        print(f"\nRunning episode {i + 1}/{runs} ...")
         result = evaluate_once(
             config=run_config,
             duration_s=duration,
@@ -367,9 +468,12 @@ def run_evaluation(
             offensive_count=offensive_count,
             defensive_count=defensive_count,
             silent_events=silent_events,
+            cbs_eval_max_agents=cbs_eval_max_agents,
+            strategy_interval_frames=strategy_interval_frames,
+            pathplan_interval_frames=pathplan_interval_frames,
         )
         all_results.append(result)
-        if show_runs:
+        if show_runs or runs > 1:
             print_run(i + 1, result)
 
     summary = aggregate_results(all_results)
@@ -406,6 +510,12 @@ def run_evaluation(
         f"{summary['pathplan_avg_ms_min']:.4f}/"
         f"{summary['pathplan_avg_ms_max']:.4f}"
     )
+    print(
+        "pathplan_success_rate(avg/min/max)="
+        f"{summary['pathplan_success_rate_avg']*100.0:.2f}%/"
+        f"{summary['pathplan_success_rate_min']*100.0:.2f}%/"
+        f"{summary['pathplan_success_rate_max']*100.0:.2f}%"
+    )
 
     output_path = Path(output).resolve() if output else (
         PROJECT_ROOT
@@ -424,6 +534,10 @@ def run_evaluation(
             "enable_spawn": enable_spawn,
             "offensive_count": offensive_count,
             "defensive_count": defensive_count,
+            "map_grid_cell_size": 5.0,
+            "cbs_eval_max_agents": cbs_eval_max_agents,
+            "strategy_interval_frames": strategy_interval_frames,
+            "pathplan_interval_frames": pathplan_interval_frames,
         },
         "summary": summary,
         "runs": all_results,
@@ -439,12 +553,12 @@ def main(argv: Optional[List[str]] = None) -> None:
     parser = argparse.ArgumentParser(
         description="Evaluate assignment and path-planning algorithm performance in AirCombat."
     )
-    parser.add_argument("--duration", type=float, default=600.0, help="Simulation time per run (seconds).")
+    parser.add_argument("--duration", type=float, default=180.0, help="Simulation time per run (seconds).")
     parser.add_argument("--fps", type=int, default=30, help="Simulation FPS.")
     parser.add_argument("--runs", type=int, default=5, help="How many episodes to evaluate.")
     parser.add_argument("--seed", type=int, default=42, help="Base random seed.")
-    parser.add_argument("--offensive-count", type=int, default=100, help="Initial attacker count.")
-    parser.add_argument("--defensive-count", type=int, default=100, help="Initial defender count.")
+    parser.add_argument("--offensive-count", type=int, default=90, help="Initial attacker count.")
+    parser.add_argument("--defensive-count", type=int, default=90, help="Initial defender count.")
     parser.add_argument("--show-runs", action="store_true", help="Print per-run detail lines.")
     parser.add_argument(
         "--show-events",
@@ -468,6 +582,24 @@ def main(argv: Optional[List[str]] = None) -> None:
         default="",
         help="Optional output JSON path. Defaults to remark/eval_report_<timestamp>.json",
     )
+    parser.add_argument(
+        "--cbs-eval-max-agents",
+        type=int,
+        default=6,
+        help="How many assigned defenders are included in each frame's CBS benchmark.",
+    )
+    parser.add_argument(
+        "--strategy-interval-frames",
+        type=int,
+        default=2,
+        help="Run assignment/strategy update every N frames.",
+    )
+    parser.add_argument(
+        "--pathplan-interval-frames",
+        type=int,
+        default=4,
+        help="Run CBS path planning every N frames (must be >= 1).",
+    )
 
     args = parser.parse_args(argv)
 
@@ -483,6 +615,9 @@ def main(argv: Optional[List[str]] = None) -> None:
         offensive_count=args.offensive_count,
         defensive_count=args.defensive_count,
         silent_events=(not args.show_events),
+        cbs_eval_max_agents=max(0, args.cbs_eval_max_agents),
+        strategy_interval_frames=max(1, args.strategy_interval_frames),
+        pathplan_interval_frames=max(1, args.pathplan_interval_frames),
     )
 
 

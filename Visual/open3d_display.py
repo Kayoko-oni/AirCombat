@@ -199,6 +199,18 @@ class Open3DDisplay:
         ]
         return "\n".join(status_lines)
 
+    def _safe_add_dynamic_geometry(self, name: str, geometry, material) -> bool:
+        """Add dynamic geometry defensively to avoid GUI crashes from invalid shapes."""
+        if geometry is None:
+            return False
+        try:
+            self.scene_widget.scene.add_geometry(name, geometry, material)
+            self.dynamic_geometries.add(name)
+            return True
+        except Exception as exc:
+            print(f"[WARN] Skip geometry {name}: {exc}")
+            return False
+
     def update(self, drones: List[BaseDrone], detections, base_health: float, base_position):
         if not self.is_open:
             return
@@ -223,23 +235,20 @@ class Open3DDisplay:
                     debris = create_explosion_mesh(drone.position, drone.death_timer, drone.death_effect_duration, color=explosion_color)
                     material = self.rendering.MaterialRecord()
                     material.base_color = explosion_color + (1.0,)
-                    self.scene_widget.scene.add_geometry(f"explosion_{drone.name}", debris, material)
-                    self.dynamic_geometries.add(f"explosion_{drone.name}")
+                    self._safe_add_dynamic_geometry(f"explosion_{drone.name}", debris, material)
                 else:
                     fall_color = (0.6, 0.1, 0.1) if drone.drone_type in {"AttackDrone", "TankDrone"} else (0.1, 0.1, 0.6)
                     mesh = create_drone_mesh(drone.position, color=fall_color)
                     material = self.rendering.MaterialRecord()
                     material.base_color = fall_color + (1.0,)
-                    self.scene_widget.scene.add_geometry(f"falling_{drone.name}", mesh, material)
-                    self.dynamic_geometries.add(f"falling_{drone.name}")
+                    self._safe_add_dynamic_geometry(f"falling_{drone.name}", mesh, material)
                     if len(drone.trail) > 1:
                         path = create_path_line(drone.trail, color=fall_color)
                         if path is not None:
                             material_trail = self.rendering.MaterialRecord()
                             material_trail.shader = 'unlitLine'
                             material_trail.base_color = fall_color + (1.0,)
-                            self.scene_widget.scene.add_geometry(f"trail_{drone.name}", path, material_trail)
-                            self.dynamic_geometries.add(f"trail_{drone.name}")
+                            self._safe_add_dynamic_geometry(f"trail_{drone.name}", path, material_trail)
                 continue
 
             color = self._drone_color(drone)
@@ -247,8 +256,7 @@ class Open3DDisplay:
             material = self.rendering.MaterialRecord()
             material.base_color = color + (1.0,)
             # TODO: 增加视觉效果
-            self.scene_widget.scene.add_geometry(f"drone_{drone.name}", mesh, material)
-            self.dynamic_geometries.add(f"drone_{drone.name}")
+            self._safe_add_dynamic_geometry(f"drone_{drone.name}", mesh, material)
 
             if len(drone.trail) > 1:
                 trail_color = (1.0, 0.2, 0.2) if drone.drone_type in {"AttackDrone", "TankDrone"} else (0.2, 0.4, 1.0)
@@ -257,8 +265,7 @@ class Open3DDisplay:
                     material_trail = self.rendering.MaterialRecord()
                     material_trail.shader = 'unlitLine'
                     material_trail.base_color = trail_color + (1.0,)
-                    self.scene_widget.scene.add_geometry(f"trail_{drone.name}", path, material_trail)
-                    self.dynamic_geometries.add(f"trail_{drone.name}")
+                    self._safe_add_dynamic_geometry(f"trail_{drone.name}", path, material_trail)
             # 如果存在避障路径缓存（来自 PathTracker 或 CBS），可视化显示
             # 优先显示防守方的 CBS 路径 (_cbs_path)（红色），其次显示个人避障路径 (_avoid_path)（绿色）
             if self.show_paths:
@@ -270,16 +277,14 @@ class Open3DDisplay:
                             material_p = self.rendering.MaterialRecord()
                             material_p.shader = 'unlitLine'
                             material_p.base_color = (0.6, 0.2, 0.8, 1.0)
-                            self.scene_widget.scene.add_geometry(f"path_{drone.name}", p, material_p)
-                            self.dynamic_geometries.add(f"path_{drone.name}")
+                            self._safe_add_dynamic_geometry(f"path_{drone.name}", p, material_p)
                     elif hasattr(drone, "_avoid_path") and drone._avoid_path:
                         p = create_path_line(drone._avoid_path, color=(0.2, 0.8, 0.2))
                         if p is not None:
                             material_p = self.rendering.MaterialRecord()
                             material_p.shader = 'unlitLine'
                             material_p.base_color = (0.2, 0.8, 0.2, 1.0)
-                            self.scene_widget.scene.add_geometry(f"path_{drone.name}", p, material_p)
-                            self.dynamic_geometries.add(f"path_{drone.name}")
+                            self._safe_add_dynamic_geometry(f"path_{drone.name}", p, material_p)
                 except Exception:
                     pass
             # 显示防守分配连线：若 defender 有 `_assigned_target` 属性，则用虚线显示到目标
@@ -291,8 +296,7 @@ class Open3DDisplay:
                         material_assign = self.rendering.MaterialRecord()
                         material_assign.shader = 'unlitLine'
                         material_assign.base_color = (1.0, 0.8, 0.0, 1.0)
-                        self.scene_widget.scene.add_geometry(f"assign_{drone.name}", dash, material_assign)
-                        self.dynamic_geometries.add(f"assign_{drone.name}")
+                        self._safe_add_dynamic_geometry(f"assign_{drone.name}", dash, material_assign)
             except Exception:
                 pass
             enemies = defensive if drone in offensive else offensive

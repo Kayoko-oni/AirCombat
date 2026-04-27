@@ -177,4 +177,3 @@ class PathTracker:
             self.last_replan = now
             logger.info("Replan failed: drone=%s time=%.1fms", getattr(self.drone, "name", "?"), elapsed_ms)
             return None
-*** End Patch

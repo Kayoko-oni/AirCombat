@@ -75,11 +75,35 @@ def create_drone_model_mesh(position, color=(1.0, 0.0, 0.0)):
 def create_path_line(points, color=(1.0, 0.0, 0.0)):
     if len(points) < 2:
         return None
+
+    pts = np.asarray(points, dtype=float)
+    if pts.ndim != 2 or pts.shape[1] < 3:
+        return None
+    pts = pts[:, :3]
+
+    # Filament may crash on invalid AABB when points contain NaN/Inf.
+    finite_mask = np.isfinite(pts).all(axis=1)
+    pts = pts[finite_mask]
+    if len(pts) < 2:
+        return None
+
+    # Remove consecutive duplicates to avoid zero-length segments.
+    filtered = [pts[0]]
+    for point in pts[1:]:
+        if np.linalg.norm(point - filtered[-1]) > 1e-6:
+            filtered.append(point)
+    if len(filtered) < 2:
+        return None
+
+    lines = [[i, i + 1] for i in range(len(filtered) - 1)]
+    if not lines:
+        return None
+
     line_set = o3d.geometry.LineSet(
-        points=o3d.utility.Vector3dVector(points),
-        lines=o3d.utility.Vector2iVector([[i, i + 1] for i in range(len(points) - 1)]),
+        points=o3d.utility.Vector3dVector(np.asarray(filtered)),
+        lines=o3d.utility.Vector2iVector(lines),
     )
-    total = len(points) - 1
+    total = len(lines)
     colors = []
     for index in range(total):
         fade = 0.3 + 0.7 * ((index + 1) / total)
@@ -96,9 +120,11 @@ def create_dashed_line(start, end, color=(1.0, 0.8, 0.0), dash_length=8.0, gap_l
     """
     start = np.array(start, dtype=float)
     end = np.array(end, dtype=float)
+    if not np.isfinite(start).all() or not np.isfinite(end).all():
+        return None
     vec = end - start
     dist = np.linalg.norm(vec)
-    if dist < 1e-6:
+    if not np.isfinite(dist) or dist < 1e-6:
         return None
     dirv = vec / dist
     segment = dash_length + gap_length
