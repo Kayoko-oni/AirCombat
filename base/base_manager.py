@@ -16,6 +16,8 @@ class BaseManager:
             if drone.drone_type in {"AttackDrone", "TankDrone"} and drone.is_alive():
                 if distance(drone.position, self.position) < self.collision_radius:
                     damage = drone.attack_power         # 记录进攻方攻击力
+                    # 标记为与基地碰撞造成的坠毁（视为碰撞类死亡）
+                    drone.death_cause = "collision"
                     drone.apply_damage(drone.health)  # 进攻方坠毁
                     self.health -= damage          # 基地扣血
                     print(f"Base hit by {drone.name}, damage={damage}, health={self.health:.1f}")

@@ -37,6 +37,9 @@ def resolve_collisions(collisions: List[Tuple[BaseDrone, BaseDrone]]) -> None:
     for drone_a, drone_b in collisions:
         relative_speed = sum(abs(a - b) for a, b in zip(drone_a.velocity, drone_b.velocity))
         damage = max(35.0, min(130.0, relative_speed * 3.0))
+        # 标记为碰撞造成的伤害，这样可视化在坠落阶段区分样式
+        drone_a.death_cause = "collision"
+        drone_b.death_cause = "collision"
         drone_a.apply_damage(damage)
         drone_b.apply_damage(damage)
         if drone_a.is_alive():

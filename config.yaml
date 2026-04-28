@@ -10,13 +10,6 @@ map:
     padding: 2.5
     max_attempts_per_building: 2000
   # TODO: 添加边界定义和障碍物
-
-radar:
-  range: 500
-  pulse_interval: 1.0
-  delay: 0.5
-  # TODO: 添加噪声和精度参数
-
 base:
   health: 100
   position: [75, 75, 0]

@@ -47,8 +47,7 @@ AirCombat/
 │   ├── single_control.py        # 单机控制逻辑（移动、边界检查）
 │   └── collision_handler.py     # 碰撞检测和伤害处理
 │
-├── sensing/                     # 感知模块
-│   └── radar.py                 # 雷达探测系统
+ 
 │
 ├── Visual/                      # 可视化模块
 │   ├── open3d_display.py        # Open3D GUI封装和界面管理
@@ -64,7 +63,7 @@ AirCombat/
 
 - **drones/**: 无人机类层次结构。`base_drone.py` 定义基础属性如位置、健康、轨迹。子类实现特定行为。
 - **Controller/**: 控制逻辑。`single_control.py` 处理移动和边界，`collision_handler.py` 检测碰撞并应用伤害。
-- **sensing/**: 感知系统。目前包含雷达探测，用于检测附近无人机。
+ 
 - **Visual/**: 可视化组件。`open3d_display.py` 管理GUI窗口和3D渲染，`render_utils.py` 提供几何体生成。
 - **utils/**: 通用工具，如日志记录。
 
@@ -110,7 +109,6 @@ python main.py
 编辑 `config.yaml` 文件来调整参数：
 
 - **地图设置**：`map.width`, `map.height`
-- **雷达参数**：`radar.range`, `radar.pulse_interval`
 - **无人机属性**：`drones.attack.speed`, `drones.tank.health` 等
 - **仿真参数**：`simulation.fps`, `simulation.duration`
 
@@ -138,9 +136,7 @@ python main.py
 - **swarm_control.py**: 集群任务分配和协同控制
 - **collision_handler.py**: 检测和处理无人机间的碰撞
 
-### sensing/ - 感知系统
-- **radar.py**: 模拟雷达探测，检测范围内无人机
-- **scout_system.py**: 侦察机专用精确识别系统
+ 
 
 ### Visual/ - 可视化
 - **open3d_display.py**: Open3D 渲染引擎封装
@@ -225,15 +221,7 @@ AirCombat 采用模块化设计，各模块职责清晰分离：
   - 检测无人机间距离
   - 碰撞时反向速度避免重叠
 
-#### 4. 感知系统 (`sensing/`)
-- **`radar.py`**: 雷达探测器
-  - 距离检测（500米范围）
-  - 返回无人机信息（位置、类型、血量）
-
-- **`scout_system.py`**: 侦察系统
-  - 精确识别无人机状态
-  - 分类和状态监控
-
+ 
 #### 5. 可视化系统 (`Visual/`)
 - **`open3d_display.py`**: Open3D 渲染引擎
   - 窗口创建和管理
@@ -255,7 +243,7 @@ AirCombat 采用模块化设计，各模块职责清晰分离：
 
 #### 7. 数据存储 (`data/`)
 - **`maps/base_map.json`**: 地图配置
-- **`detection/radar_log.json`**: 探测记录（空）
+- **`maps/base_map.json`**: 地图配置
 - **`simulation/trajectories.json`**: 轨迹数据（空）
 
 #### 8. 工具库 (`utils/`)
@@ -273,7 +261,6 @@ YAML 配置文件包含所有可调参数：
 
 ```yaml
 map:           # 地图设置
-radar:         # 雷达参数
 simulation:    # 仿真参数
 drones:        # 四种机型详细配置
   attack:      # 攻击机参数
@@ -285,15 +272,14 @@ drones:        # 四种机型详细配置
 ### 运行流程
 
 1. **初始化阶段**：
-   - 加载配置
-   - 创建4个无人机实例
-   - 初始化雷达和显示系统
+  - 加载配置
+  - 创建4个无人机实例
+  - 初始化显示系统
 
 2. **仿真循环**（每帧）：
-   - 更新所有无人机位置
-   - 雷达扫描检测
-   - 可视化渲染
-   - 帧率控制（30FPS）
+  - 更新所有无人机位置
+  - 可视化渲染
+  - 帧率控制（30FPS）
 
 3. **结束处理**：
    - 关闭显示窗口
@@ -305,7 +291,7 @@ drones:        # 四种机型详细配置
 
 - **算法接口**：`algorithms/` 中的占位符可替换为真实算法
 - **控制逻辑**：`swarm_control.py` 可添加复杂协同行为
-- **感知增强**：`sensing/` 可添加延迟、模糊等效果
+ 
 - **可视化扩展**：`Visual/` 可添加雷达圈、路径显示
 - **数据持久化**：`data/` 中的 JSON 文件可实现日志保存
 

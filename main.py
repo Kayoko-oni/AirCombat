@@ -12,7 +12,6 @@ from drones.defensive.scout_drone import ScoutDrone
 from drones.defensive.interceptor_drone import InterceptorDrone
 from drones.factory import create_drone_team, create_attack_drone, create_tank_drone, create_interceptor_drone, create_scout_drone
 from Controller.single_control import chase_target, chase_point, move_drone
-from sensing.radar import RadarSensor
 from utils.logger import get_logger
 from base.base_manager import BaseManager
 
@@ -283,8 +282,7 @@ def run_simulation(config: dict):
     #创建无人机初始团队
     base_manager = BaseManager(config)
     #创建基地管理器实例, 从配置中读取基地的相关参数
-    radar = RadarSensor(range_m=config["radar"]["range"], pulse_interval=config["radar"]["pulse_interval"])
-    #创建雷达传感器实例, 从配置中读取range_m和pulse_interval
+    # 雷达传感器已移除，仿真不再执行探测扫描
     display = None
     if Open3DDisplay is not None:
         try:
@@ -377,8 +375,7 @@ def run_simulation(config: dict):
             #10. 平衡防守方数量
             balance_defenders(config, drones) #每帧立即平衡防守方数量, 直到防守方数量 >= 进攻方数量"""
 
-            detections = radar.scan(alive_drones)
-            #雷达扫描一次所有存活的无人机 """
+            detections = []
             LOGGER.debug("Detected %d objects", len(detections))
             if display is not None:
                 display.update(drones, detections, base_manager.get_health(), base_position)

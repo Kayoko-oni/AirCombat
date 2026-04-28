@@ -5,7 +5,14 @@ import yaml
 
 from utils.map_loader import generate_buildings
 from drones.base_drone import BaseDrone
-from Visual.render_utils import create_drone_mesh, create_path_line, create_explosion_mesh, create_drone_model_mesh, create_guts_base_mesh, create_dashed_line
+from Visual.render_utils import (
+    create_drone_mesh,
+    create_path_line,
+    create_explosion_mesh,
+    create_drone_model_mesh,
+    create_guts_base_mesh,
+    create_dashed_line,
+)
 
 
 class Open3DDisplay:
@@ -28,7 +35,7 @@ class Open3DDisplay:
         self.scene_widget = self.gui.SceneWidget()
         self.scene_widget.scene = self.rendering.Open3DScene(self.window.renderer)
         self.window.add_child(self.scene_widget)
-        
+
         # Status label as HUD overlay
         self.status_label = self.gui.Label("")
         self.status_label.text_color = self.gui.Color(1.0, 1.0, 1.0, 1.0)
@@ -36,10 +43,10 @@ class Open3DDisplay:
         self.window.add_child(self.status_label)
         # Position the label at top-left
         self.status_label.frame = self.gui.Rect(10, 10, 350, 100)
-        
+
         # Set scene widget to fill the window
         self.scene_widget.frame = self.gui.Rect(0, 0, self.window.content_rect.width, self.window.content_rect.height)
-        
+
         self.is_open = True
         self.paused = False
 
@@ -51,19 +58,23 @@ class Open3DDisplay:
         self.map_data_initialized = False   # 地图数据是否已生成
         self.buildings = None               # 建筑列表
         self.map_grid = None                # 障碍物网格对象
-        
+
         # Set up camera
-        import numpy as np
-        bounds = self.o3d.geometry.AxisAlignedBoundingBox(np.array([-1000, -1000, -100], dtype=np.float64), np.array([1000, 1000, 100], dtype=np.float64))
-        center = np.array([0., 0., 0.], dtype=np.float32)
+        bounds = self.o3d.geometry.AxisAlignedBoundingBox(
+            np.array([-1000, -1000, -100], dtype=np.float64),
+            np.array([1000, 1000, 100], dtype=np.float64),
+        )
+        center = np.array([0.0, 0.0, 0.0], dtype=np.float32)
         self.scene_widget.setup_camera(45.0, bounds, center)
         self.scene_widget.set_view_controls(self.gui.SceneWidget.Controls.ROTATE_CAMERA)
 
     def _mouse_callback(self, event):
         if event.type == self.gui.MouseEvent.Type.BUTTON_DOWN and event.is_button_down(self.gui.MouseButton.RIGHT):
-            import numpy as np
-            bounds = self.o3d.geometry.AxisAlignedBoundingBox(np.array([-1000, -1000, -100], dtype=np.float64), np.array([1000, 1000, 100], dtype=np.float64))
-            center = np.array([0., 0., 0.], dtype=np.float32)
+            bounds = self.o3d.geometry.AxisAlignedBoundingBox(
+                np.array([-1000, -1000, -100], dtype=np.float64),
+                np.array([1000, 1000, 100], dtype=np.float64),
+            )
+            center = np.array([0.0, 0.0, 0.0], dtype=np.float32)
             self.scene_widget.setup_camera(45.0, bounds, center)
             return self.gui.SceneWidget.EventCallbackResult.CONSUMED
         return self.gui.SceneWidget.EventCallbackResult.IGNORED
@@ -104,6 +115,7 @@ class Open3DDisplay:
         """在原点添加基地模型（灰色长方体+绿色球体）"""
         # 使用我们之前定义的 create_guts_base_mesh 函数
         from Visual.render_utils import create_guts_base_mesh
+
         base_mesh = create_guts_base_mesh(base_position)
         material = self.rendering.MaterialRecord()
         material.shader = 'defaultLit'
@@ -147,7 +159,7 @@ class Open3DDisplay:
             cx, cy, cz = center
             sx, sy, sz = size
             box = self.o3d.geometry.TriangleMesh.create_box(width=sx, height=sy, depth=sz)
-            box.translate([cx - sx/2, cy - sy/2, cz - sz/2])
+            box.translate([cx - sx / 2, cy - sy / 2, cz - sz / 2])
             box.paint_uniform_color((0.8, 0.8, 0.8))
             combined += box
         combined.compute_vertex_normals()
@@ -214,15 +226,18 @@ class Open3DDisplay:
     def update(self, drones: List[BaseDrone], detections, base_health: float, base_position):
         if not self.is_open:
             return
-        
+
         if not self.map_initialized:
             self._init_map_data()   # 只执行一次，生成 self.buildings 和 self.map_grid
 
-        if not self.static_objects_added: #只在首次更新时添加静态物体（坐标轴、地面、基地模型）
+        if not self.static_objects_added:  # 只在首次更新时添加静态物体（坐标轴、地面、基地模型）
             self._add_static_objects(base_position)
 
-        for name in self.dynamic_geometries:
-            self.scene_widget.scene.remove_geometry(name)
+        for name in list(self.dynamic_geometries):
+            try:
+                self.scene_widget.scene.remove_geometry(name)
+            except Exception:
+                pass
         self.dynamic_geometries.clear()
 
         offensive = [d for d in drones if d.drone_type in {"AttackDrone", "TankDrone"} and not d.destroyed]
@@ -237,8 +252,14 @@ class Open3DDisplay:
                     material.base_color = explosion_color + (1.0,)
                     self._safe_add_dynamic_geometry(f"explosion_{drone.name}", debris, material)
                 else:
-                    fall_color = (0.6, 0.1, 0.1) if drone.drone_type in {"AttackDrone", "TankDrone"} else (0.1, 0.1, 0.6)
-                    mesh = create_drone_mesh(drone.position, color=fall_color)
+                    # 若为碰撞导致的坠毁，使用灰色无人机模型和灰色轨迹；否则沿用原有球体与颜色
+                    if getattr(drone, "death_cause", None) == "collision":
+                        fall_color = (0.8, 0.8, 0.8)
+                        mesh = create_drone_model_mesh(drone.position, color=fall_color)
+                    else:
+                        fall_color = (0.6, 0.1, 0.1) if drone.drone_type in {"AttackDrone", "TankDrone"} else (0.1, 0.1, 0.6)
+                        mesh = create_drone_mesh(drone.position, color=fall_color)
+
                     material = self.rendering.MaterialRecord()
                     material.base_color = fall_color + (1.0,)
                     self._safe_add_dynamic_geometry(f"falling_{drone.name}", mesh, material)
@@ -271,7 +292,7 @@ class Open3DDisplay:
             if self.show_paths:
                 try:
                     if hasattr(drone, "_cbs_path") and drone._cbs_path:
-                        # 使用不那么刺眼的紫色来区分于进攻方轨迹（红色）
+                        # 使用紫色来区分于进攻方轨迹（红色）
                         p = create_path_line(drone._cbs_path, color=(0.6, 0.2, 0.8))
                         if p is not None:
                             material_p = self.rendering.MaterialRecord()
@@ -299,17 +320,13 @@ class Open3DDisplay:
                         self._safe_add_dynamic_geometry(f"assign_{drone.name}", dash, material_assign)
             except Exception:
                 pass
+
             enemies = defensive if drone in offensive else offensive
             nearest_dist = self._nearest_enemy_distance(drone, enemies)
-            # Removed 3D label for each drone to reduce clutter
-            # label_text = self._label_text(drone, nearest_dist)
-            # self.scene_widget.add_3d_label(drone.position, label_text)
 
-        # Update status label as HUD
         status_text = self._status_text(drones, base_health)
         self.status_label.text = status_text
 
-        # Force redraw
         self.scene_widget.force_redraw()
         self.window.post_redraw()
 

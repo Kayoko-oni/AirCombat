@@ -40,6 +40,7 @@ class BaseDrone:
     death_effect_duration: float = 1.5
     ground_height: float = 0.0
     gravity: float = 9.8
+    death_cause: str | None = None
 
     def update_position(self, delta_time: float) -> None:
         """根据当前速度更新位置"""
@@ -67,6 +68,7 @@ class BaseDrone:
         if self.battery <= 0.0:
             self.battery = 0.0
             # 造成等同于当前血量的伤害，触发坠落/死亡流程
+            self.death_cause = "battery"
             self.apply_damage(self.health)
 
     def update_fall(self, delta_time: float) -> None:
