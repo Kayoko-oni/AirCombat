@@ -11,12 +11,6 @@ map:
     max_attempts_per_building: 2000
   # TODO: 添加边界定义和障碍物
 
-radar:
-  range: 500
-  pulse_interval: 1.0
-  delay: 0.5
-  # TODO: 添加噪声和精度参数
-
 base:
   health: 100
   position: [75, 75, 0]
@@ -34,6 +28,17 @@ simulation:
   spawn_interval_max: 6.0
   # 最大同时存在的进攻方数量（用于限制自动生成）
   max_offensive: 6
+  # 进攻方初始化高度分布（低空+高空）
+  offensive_spawn_z_low_min: 5.0
+  offensive_spawn_z_low_max: 30.0
+  offensive_spawn_z_high_min: 80.0
+  offensive_spawn_z_high_max: 160.0
+  offensive_spawn_high_ratio: 0.5
+  # 进攻方低空贴建筑绕行设置
+  offensive_obstacle_avoid: true
+  offensive_avoid_low_alt_threshold: 30.0 # 越大，更多高度会启用贴建筑绕行
+  offensive_avoid_corridor_cells: 1 # 越大，越敏感（更容易触发 A*）
+  offensive_avoid_sample_count: 8 # 越大，检测更严格但开销更高
   
 path_planning:
   # 路径重规划相关参数（可在调试时调整）
@@ -73,6 +78,28 @@ assignment:
   non_responder_penalty: 60.0
   sticky_assignment_bonus: 12.0
   reassignment_penalty: 7.0
+
+  # 高度权重距离配置
+  height_weight: 1.5
+  use_geographic_coords: true
+  geo_origin_lat: 30.1234 # 局部坐标原点（用于地理坐标转换）
+  geo_origin_lon: 120.5678
+  geo_origin_alt: 15.0
+  position_noise_std: 1.0 # 米，位置测量噪声标准差
+
+  # LOS 与相对速度驱动配置
+  enable_los: true
+  los_height_margin: 2.0
+  los_blocked_penalty: 80.0
+  enable_relative_speed: true
+  relative_speed_weight: 10.0
+  relative_speed_ref: 25.0
+
+  # 向量化 + 空间分区配置
+  enable_spatial_partition: true
+  spatial_cell_size: 120.0
+  spatial_query_radius: 1200.0
+  out_of_range_penalty: 1000000.0
 
 drones:
   attack:

@@ -1,8 +1,9 @@
-from __future__ import annotations
+from __future__ import annotations 
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass 
 from importlib import import_module
+import math
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -13,10 +14,10 @@ _MAX_SPEED_REF = 40.0
 _MAX_ATTACK_POWER_REF = 30.0
 
 try:
-    # 优先复用 AirCombat 已定义的几何距离函数。
-    _aircombat_distance = getattr(import_module("utils.geometry"), "distance")
+    _geometry_module = import_module("utils.geometry")
+    _geo_to_local_enu = getattr(_geometry_module, "geodetic_to_local_enu")
 except Exception:
-    _aircombat_distance = None
+    _geo_to_local_enu = None
 
 
 @dataclass(frozen=True)
@@ -60,6 +61,22 @@ class ImprovedAuctionConfig:
     response_threshold: float = 0.30
     attention_temperature: float = 0.70
     distance_weight: float = 1.0
+    height_weight: float = 1.0
+    use_geographic_coords: bool = False
+    geo_origin_lat: float = 0.0
+    geo_origin_lon: float = 0.0
+    geo_origin_alt: float = 0.0
+    position_noise_std: float = 0.0
+    enable_los: bool = True
+    los_height_margin: float = 2.0
+    los_blocked_penalty: float = 60.0
+    enable_relative_speed: bool = True
+    relative_speed_weight: float = 10.0
+    relative_speed_ref: float = 25.0
+    enable_spatial_partition: bool = True
+    spatial_cell_size: float = 120.0
+    spatial_query_radius: float = 0.0
+    out_of_range_penalty: float = 1.0e6
     urgency_weight: float = 35.0
     load_balance_weight: float = 18.0
     feasibility_weight: float = 16.0
@@ -314,6 +331,7 @@ def greedy_assignment(
     defenders: List[Any],
     attackers: List[Any],
     config: ImprovedAuctionConfig | None = None,
+    map_grid: Optional[Any] = None,
 ) -> Dict[str, Optional[Any]]:
     """基于改进拍卖算法的 AirCombat 兼容分配接口。
 
@@ -330,7 +348,7 @@ def greedy_assignment(
     cfg = config or ImprovedAuctionConfig()
 
     # 将论文中的“提议-响应-选择”思想落地为效用增强，而非仅做纯距离匹配。
-    utility = _build_cma_enhanced_utility(defenders, attackers, cfg)
+    utility = _build_cma_enhanced_utility(defenders, attackers, cfg, map_grid=map_grid)
 
     solver = ImprovedAuctionSolver(cfg)
     n_def, n_att = utility.shape
@@ -370,38 +388,255 @@ def _remember_assignment(assignment: Dict[str, Optional[Any]]) -> None:
     _LAST_TARGET_BY_DEFENDER = next_mapping
 
 
+def _resolve_geo_position(entity: Any) -> Tuple[float, float, float]:
+    """提取经纬度与高度坐标，返回 (lat, lon, alt)。"""
+    if hasattr(entity, "geo_position"):
+        geo = getattr(entity, "geo_position")
+    else:
+        geo = getattr(entity, "position", None)
+    if geo is None:
+        raise ValueError("geo position not found on entity")
+    if len(geo) < 2:
+        raise ValueError("geo position must contain at least lat and lon")
+    lat = float(geo[0])
+    lon = float(geo[1])
+    alt = float(geo[2]) if len(geo) > 2 else 0.0
+    return lat, lon, alt
+
+
+def _resolve_position(entity: Any, cfg: ImprovedAuctionConfig) -> np.ndarray:
+    """Resolve entity position into local 3D meters."""
+    if cfg.use_geographic_coords:
+        if _geo_to_local_enu is None:
+            raise ImportError("未找到 utils.geometry.geodetic_to_local_enu")
+        lat, lon, alt = _resolve_geo_position(entity)
+        local = _geo_to_local_enu(
+            lat,
+            lon,
+            alt,
+            cfg.geo_origin_lat,
+            cfg.geo_origin_lon,
+            cfg.geo_origin_alt,
+        )
+        return np.asarray(local, dtype=np.float64)
+
+    position = np.asarray(getattr(entity, "position", [0.0, 0.0, 0.0]), dtype=np.float64)
+    if position.size >= 3:
+        return position[:3]
+    if position.size == 2:
+        return np.asarray([position[0], position[1], 0.0], dtype=np.float64)
+    if position.size == 1:
+        return np.asarray([position[0], 0.0, 0.0], dtype=np.float64)
+    return np.asarray([0.0, 0.0, 0.0], dtype=np.float64)
+
+
+def _build_positions(entities: List[Any], cfg: ImprovedAuctionConfig) -> np.ndarray:
+    if not entities:
+        return np.zeros((0, 3), dtype=np.float64)
+    positions = np.vstack([_resolve_position(entity, cfg) for entity in entities])
+    if cfg.position_noise_std > 0:
+        noise = np.random.normal(0.0, cfg.position_noise_std, size=positions.shape)
+        positions = positions + noise
+    return positions
+
+
+def _build_velocities(entities: List[Any]) -> np.ndarray:
+    if not entities:
+        return np.zeros((0, 3), dtype=np.float64)
+    velocities = []
+    for entity in entities:
+        vel = np.asarray(getattr(entity, "velocity", [0.0, 0.0, 0.0]), dtype=np.float64)
+        if vel.size >= 3:
+            velocities.append(vel[:3])
+        elif vel.size == 2:
+            velocities.append(np.asarray([vel[0], vel[1], 0.0], dtype=np.float64))
+        elif vel.size == 1:
+            velocities.append(np.asarray([vel[0], 0.0, 0.0], dtype=np.float64))
+        else:
+            velocities.append(np.asarray([0.0, 0.0, 0.0], dtype=np.float64))
+    return np.vstack(velocities)
+
+
+def _pairwise_distance_matrix(
+    defender_positions: np.ndarray,
+    attacker_positions: np.ndarray,
+    height_weight: float,
+) -> np.ndarray:
+    if defender_positions.size == 0 or attacker_positions.size == 0:
+        return np.zeros((defender_positions.shape[0], attacker_positions.shape[0]), dtype=np.float64)
+    diffs = attacker_positions[None, :, :] - defender_positions[:, None, :]
+    diffs[:, :, 2] = diffs[:, :, 2] * abs(height_weight)
+    return np.linalg.norm(diffs, axis=2)
+
+
+def _pairwise_closing_rate_matrix(
+    defender_positions: np.ndarray,
+    attacker_positions: np.ndarray,
+    defender_velocities: np.ndarray,
+    attacker_velocities: np.ndarray,
+) -> np.ndarray:
+    if defender_positions.size == 0 or attacker_positions.size == 0:
+        return np.zeros((defender_positions.shape[0], attacker_positions.shape[0]), dtype=np.float64)
+    rel_pos = attacker_positions[None, :, :] - defender_positions[:, None, :]
+    rel_vel = attacker_velocities[None, :, :] - defender_velocities[:, None, :]
+    dist = np.linalg.norm(rel_pos, axis=2)
+    closing = -np.sum(rel_pos * rel_vel, axis=2) / (dist + 1e-6)
+    return closing
+
+
+def _relative_speed_score(closing_rate: np.ndarray, ref_speed: float) -> np.ndarray:
+    if ref_speed <= 0:
+        return np.zeros_like(closing_rate)
+    return np.clip(closing_rate / ref_speed, 0.0, 1.0)
+
+
+def _build_spatial_index(positions: np.ndarray, cell_size: float) -> Optional[Dict[Tuple[int, int], List[int]]]:
+    if positions.size == 0 or cell_size <= 0:
+        return None
+    cells: Dict[Tuple[int, int], List[int]] = {}
+    coords = np.floor(positions[:, :2] / cell_size).astype(np.int64)
+    for idx, (cx, cy) in enumerate(coords):
+        key = (int(cx), int(cy))
+        cells.setdefault(key, []).append(idx)
+    return cells
+
+
+def _query_spatial_index(
+    cells: Optional[Dict[Tuple[int, int], List[int]]],
+    position: np.ndarray,
+    cell_size: float,
+    radius: float,
+) -> List[int]:
+    if cells is None or cell_size <= 0 or radius <= 0:
+        return []
+    cx = int(math.floor(position[0] / cell_size))
+    cy = int(math.floor(position[1] / cell_size))
+    r = int(math.ceil(radius / cell_size))
+    results: List[int] = []
+    for dx in range(-r, r + 1):
+        for dy in range(-r, r + 1):
+            results.extend(cells.get((cx + dx, cy + dy), []))
+    return results
+
+
+def _line_of_sight(
+    p1: np.ndarray,
+    p2: np.ndarray,
+    map_grid: Optional[Any],
+    height_margin: float,
+) -> bool:
+    if map_grid is None:
+        return True
+    if hasattr(map_grid, "max_height_along_line"):
+        max_h = float(map_grid.max_height_along_line(tuple(p1), tuple(p2)))
+        if max_h <= 0.0:
+            return True
+        min_z = min(float(p1[2]), float(p2[2]))
+        return min_z > max_h + height_margin
+    try:
+        from algorithms.cbs_pathplan import line_of_sight_world
+    except Exception:
+        line_of_sight_world = None
+    if line_of_sight_world is None:
+        return True
+    return bool(line_of_sight_world(tuple(p1), tuple(p2), map_grid))
+
+
+def _weighted_distance(pos_a: np.ndarray, pos_b: np.ndarray, height_weight: float) -> float:
+    delta = pos_a - pos_b
+    dz = delta[2] * abs(height_weight)
+    return float(np.sqrt(delta[0] * delta[0] + delta[1] * delta[1] + dz * dz))
+
+
 def _build_cma_enhanced_utility(
     defenders: List[Any],
     attackers: List[Any],
     cfg: ImprovedAuctionConfig,
+    map_grid: Optional[Any] = None,
 ) -> np.ndarray:
     """构建融合“提议-响应-选择”机制的效用矩阵。"""
-    if _aircombat_distance is None:
-        raise ImportError(
-            "未找到 utils.geometry.distance。请将本文件放入 AirCombat 仓库后再运行。"
-        )
+    if cfg.use_geographic_coords and _geo_to_local_enu is None:
+        raise ImportError("未找到 utils.geometry.geodetic_to_local_enu。")
 
     n_def = len(defenders)
     n_att = len(attackers)
     utility = np.zeros((n_def, n_att), dtype=np.float64)
 
+    defender_positions = _build_positions(defenders, cfg)
+    attacker_positions = _build_positions(attackers, cfg)
+    defender_velocities = _build_velocities(defenders)
+    attacker_velocities = _build_velocities(attackers)
+    distance_matrix = _pairwise_distance_matrix(defender_positions, attacker_positions, cfg.height_weight)
+    if cfg.enable_relative_speed:
+        closing_rate_matrix = _pairwise_closing_rate_matrix(
+            defender_positions, attacker_positions, defender_velocities, attacker_velocities
+        )
+        relative_score_matrix = _relative_speed_score(closing_rate_matrix, cfg.relative_speed_ref)
+    else:
+        relative_score_matrix = np.zeros_like(distance_matrix)
+
     defender_loads = np.asarray([_estimate_defender_load(d) for d in defenders], dtype=np.float64)
+    load_term = cfg.load_balance_weight * (1.0 - defender_loads)
     task_urgencies = np.asarray(
-        [_estimate_attacker_urgency(a, cfg.max_operational_distance) for a in attackers],
+        [
+            _estimate_attacker_urgency(a, cfg.max_operational_distance, attacker_positions[idx])
+            for idx, a in enumerate(attackers)
+        ],
         dtype=np.float64,
     )
 
+    spatial_radius = cfg.spatial_query_radius if cfg.spatial_query_radius > 0 else cfg.max_operational_distance
+    spatial_index = None
+    if cfg.enable_spatial_partition:
+        spatial_index = _build_spatial_index(defender_positions, cfg.spatial_cell_size)
+
     for attacker_idx, attacker in enumerate(attackers):
         # Stage-1 提议：选择离该任务最近的防守方作为提议者。
-        proposer_idx = _select_proposer(defenders, attacker)
+        attacker_pos = attacker_positions[attacker_idx]
+        distance_row = distance_matrix[:, attacker_idx]
+        relative_row = relative_score_matrix[:, attacker_idx]
+
+        spatial_candidates: List[int]
+        if spatial_index is not None and spatial_radius > 0:
+            spatial_candidates = _query_spatial_index(
+                spatial_index,
+                attacker_pos,
+                cfg.spatial_cell_size,
+                spatial_radius,
+            )
+            if spatial_candidates:
+                spatial_candidates = sorted(set(spatial_candidates))
+            if not spatial_candidates:
+                spatial_candidates = list(range(n_def))
+        else:
+            spatial_candidates = list(range(n_def))
+
+        candidate_mask = np.zeros(n_def, dtype=bool)
+        candidate_mask[spatial_candidates] = True
+
+        proposer_idx = _select_proposer(distance_row, spatial_candidates)
         # Stage-2 响应：提议者仅与通信半径内成员协商。
-        candidate_indices = _collect_candidates(defenders, proposer_idx, cfg.communication_range)
-        feasible_scores = _response_feasibility_scores(defenders, attacker, cfg, candidate_indices)
+        proposer_delta = defender_positions - defender_positions[proposer_idx]
+        proposer_delta[:, 2] = proposer_delta[:, 2] * abs(cfg.height_weight)
+        proposer_distances = np.linalg.norm(proposer_delta, axis=1)
+        comm_candidates = _collect_candidates(
+            proposer_distances,
+            cfg.communication_range,
+            spatial_candidates,
+        )
+        if not comm_candidates:
+            comm_candidates = [proposer_idx]
+        feasible_scores = _response_feasibility_scores(
+            defenders,
+            distance_row,
+            cfg,
+            comm_candidates,
+        )
 
         feasible_map = {
             idx
             : score
-            for idx, score in zip(candidate_indices, feasible_scores)
+            for idx, score in zip(comm_candidates, feasible_scores)
             if score >= cfg.response_threshold
         }
         if not feasible_map:
@@ -410,14 +645,36 @@ def _build_cma_enhanced_utility(
         responder_set = set(responders)
 
         # Stage-3 选择：在可响应集合内进行注意力匹配打分。
-        attention_map = _cma_attention_scores(defenders, attacker, responders, cfg)
+        attention_map = _cma_attention_scores(
+            defenders,
+            attacker,
+            attacker_pos,
+            responders,
+            cfg,
+            distance_row,
+        )
         urgency = float(task_urgencies[attacker_idx])
 
+        base_row = -cfg.distance_weight * distance_row
+        base_row = base_row + cfg.relative_speed_weight * relative_row
+        utility[:, attacker_idx] = base_row + load_term + cfg.urgency_weight * urgency
+
+        if spatial_index is not None and spatial_radius > 0:
+            utility[~candidate_mask, attacker_idx] = -cfg.out_of_range_penalty
+
+        los_mask = None
+        if cfg.enable_los and map_grid is not None:
+            los_mask = np.ones(n_def, dtype=bool)
+            for idx in spatial_candidates:
+                los_mask[idx] = _line_of_sight(
+                    defender_positions[idx], attacker_pos, map_grid, cfg.los_height_margin
+                )
+            if spatial_index is not None and spatial_radius > 0:
+                los_mask[~candidate_mask] = False
+
         for defender_idx, defender in enumerate(defenders):
-            distance = float(_aircombat_distance(defender.position, attacker.position))
-            base = -cfg.distance_weight * distance
-            urgency_term = cfg.urgency_weight * urgency
-            load_term = cfg.load_balance_weight * (1.0 - float(defender_loads[defender_idx]))
+            if spatial_index is not None and spatial_radius > 0 and not candidate_mask[defender_idx]:
+                continue
 
             responder_term = 0.0
             if defender_idx in responder_set:
@@ -428,6 +685,10 @@ def _build_cma_enhanced_utility(
             else:
                 # 非响应节点直接降权，避免通信受限时被误选。
                 responder_term -= cfg.non_responder_penalty
+
+            los_term = 0.0
+            if los_mask is not None and not los_mask[defender_idx]:
+                los_term -= cfg.los_blocked_penalty
 
             defender_name = str(getattr(defender, "name", ""))
             attacker_name = str(getattr(attacker, "name", ""))
@@ -441,47 +702,46 @@ def _build_cma_enhanced_utility(
                 # 有历史目标但本轮切换时施加惩罚。
                 switch_term = -cfg.reassignment_penalty
 
-            utility[defender_idx, attacker_idx] = (
-                base + urgency_term + load_term + responder_term + switch_term
-            )
+            utility[defender_idx, attacker_idx] += responder_term + los_term + switch_term
 
     return utility
 
 
-def _select_proposer(defenders: List[Any], attacker: Any) -> int:
+def _select_proposer(distance_row: np.ndarray, candidate_indices: List[int]) -> int:
     """按距离最近原则选择提议无人机。"""
-    if not defenders:
+    if distance_row.size == 0:
         raise ValueError("defenders must be non-empty")
-    best_idx = 0
-    best_dist = float("inf")
-    for idx, defender in enumerate(defenders):
-        dist = float(_aircombat_distance(defender.position, attacker.position))
-        if dist < best_dist:
-            best_dist = dist
-            best_idx = idx
-    return best_idx
+    if not candidate_indices:
+        return int(np.argmin(distance_row))
+    candidate_dist = distance_row[candidate_indices]
+    best_local = int(np.argmin(candidate_dist))
+    return int(candidate_indices[best_local])
 
 
 def _collect_candidates(
-    defenders: List[Any],
-    proposer_idx: int,
+    proposer_distances: np.ndarray,
     communication_range: float,
+    candidate_indices: List[int],
 ) -> List[int]:
     """收集提议者通信范围内的候选防守方。"""
-    proposer = defenders[proposer_idx]
-    candidates = []
-    for idx, defender in enumerate(defenders):
-        d_comm = float(_aircombat_distance(proposer.position, defender.position))
-        if d_comm <= communication_range:
-            candidates.append(idx)
-    if proposer_idx not in candidates:
-        candidates.append(proposer_idx)
-    return candidates
+    if proposer_distances.size == 0:
+        return []
+    if not candidate_indices:
+        indices = np.flatnonzero(proposer_distances <= communication_range).tolist()
+    else:
+        indices = [
+            idx
+            for idx in candidate_indices
+            if proposer_distances[idx] <= communication_range
+        ]
+    if not indices:
+        return []
+    return indices
 
 
 def _response_feasibility_scores(
     defenders: List[Any],
-    attacker: Any,
+    distance_row: np.ndarray,
     cfg: ImprovedAuctionConfig,
     candidate_indices: List[int],
 ) -> List[float]:
@@ -490,7 +750,7 @@ def _response_feasibility_scores(
 
     for idx in candidate_indices:
         defender = defenders[idx]
-        distance_score = _pair_distance_score(defender, attacker, cfg.max_operational_distance)
+        distance_score = _pair_distance_score(distance_row[idx], cfg.max_operational_distance)
         energy_score, health_score = _defender_resource_scores(defender)
         score = (
             cfg.response_distance_weight * distance_score
@@ -505,17 +765,21 @@ def _response_feasibility_scores(
 def _cma_attention_scores(
     defenders: List[Any],
     attacker: Any,
+    attacker_position: np.ndarray,
     responder_indices: List[int],
     cfg: ImprovedAuctionConfig,
+    distance_row: np.ndarray,
 ) -> Dict[int, float]:
     """用轻量注意力计算任务与候选防守方的匹配权重。"""
     if not responder_indices:
         return {}
 
     closeness, task_speed, task_attack, task_health = _attacker_scores(
-        attacker, cfg.max_operational_distance
+        attacker, cfg.max_operational_distance, attacker_position
     )
-    urgency = _estimate_attacker_urgency(attacker, cfg.max_operational_distance)
+    urgency = _estimate_attacker_urgency(
+        attacker, cfg.max_operational_distance, attacker_position
+    )
 
     q = np.asarray(
         [
@@ -535,7 +799,7 @@ def _cma_attention_scores(
         energy_score, health_score = _defender_resource_scores(defender)
         k = np.asarray(
             [
-                _pair_distance_score(defender, attacker, cfg.max_operational_distance),
+                _pair_distance_score(distance_row[idx], cfg.max_operational_distance),
                 _ratio(_speed(defender), _MAX_SPEED_REF),
                 energy_score,
                 health_score,
@@ -550,10 +814,14 @@ def _cma_attention_scores(
     return {idx: float(p) for idx, p in zip(responder_indices, probs.tolist())}
 
 
-def _estimate_attacker_urgency(attacker: Any, max_operational_distance: float = 1200.0) -> float:
+def _estimate_attacker_urgency(
+    attacker: Any,
+    max_operational_distance: float = 1200.0,
+    attacker_position: np.ndarray | None = None,
+) -> float:
     """估计任务紧急度代理值，输出范围 [0, 1]。"""
     closeness, speed_score, attack_score, health_score = _attacker_scores(
-        attacker, max_operational_distance
+        attacker, max_operational_distance, attacker_position
     )
     urgency = 0.35 * closeness + 0.25 * speed_score + 0.25 * attack_score + 0.15 * health_score
     return float(np.clip(urgency, 0.0, 1.0))
@@ -566,9 +834,17 @@ def _estimate_defender_load(defender: Any) -> float:
     return float(np.clip(load, 0.0, 1.0))
 
 
-def _attacker_scores(attacker: Any, max_operational_distance: float) -> tuple[float, float, float, float]:
+def _attacker_scores(
+    attacker: Any,
+    max_operational_distance: float,
+    attacker_position: np.ndarray | None = None,
+) -> tuple[float, float, float, float]:
     """提取任务端归一化特征：接近基地、速度、攻击力、血量。"""
-    closeness = 1.0 - _ratio(_norm_to_base(attacker), max_operational_distance)
+    if attacker_position is None:
+        attacker_position = np.asarray(
+            getattr(attacker, "position", [0.0, 0.0, 0.0]), dtype=np.float64
+        )
+    closeness = 1.0 - _ratio(_norm_to_base_position(attacker_position), max_operational_distance)
     speed_score = _ratio(_speed(attacker), _MAX_SPEED_REF)
     attack_score = _ratio(getattr(attacker, "attack_power", 0.0), _MAX_ATTACK_POWER_REF)
     health_score = _ratio(getattr(attacker, "health", 0.0), _MAX_HEALTH_REF)
@@ -582,9 +858,8 @@ def _defender_resource_scores(defender: Any) -> tuple[float, float]:
     return energy_score, health_score
 
 
-def _pair_distance_score(defender: Any, attacker: Any, max_operational_distance: float) -> float:
+def _pair_distance_score(distance: float, max_operational_distance: float) -> float:
     """将防守方与任务的距离映射为 [0, 1] 可行性分数。"""
-    distance = float(_aircombat_distance(defender.position, attacker.position))
     return 1.0 - _ratio(distance, max_operational_distance)
 
 
@@ -594,10 +869,15 @@ def _speed(drone: Any) -> float:
     return float(np.linalg.norm(velocity))
 
 
+def _norm_to_base_position(position: np.ndarray) -> float:
+    """计算坐标相对基地(原点)的距离。"""
+    return float(np.linalg.norm(position))
+
+
 def _norm_to_base(drone: Any) -> float:
     """计算无人机相对基地(原点)的距离。"""
     position = np.asarray(getattr(drone, "position", [0.0, 0.0, 0.0]), dtype=np.float64)
-    return float(np.linalg.norm(position))
+    return _norm_to_base_position(position)
 
 
 def _ratio(value: float, max_value: float) -> float:

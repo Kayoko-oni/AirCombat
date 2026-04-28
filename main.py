@@ -12,7 +12,6 @@ from drones.defensive.scout_drone import ScoutDrone
 from drones.defensive.interceptor_drone import InterceptorDrone
 from drones.factory import create_drone_team, create_attack_drone, create_tank_drone, create_interceptor_drone, create_scout_drone
 from Controller.single_control import chase_target, chase_point, move_drone
-from sensing.radar import RadarSensor
 from utils.logger import get_logger
 from base.base_manager import BaseManager
 
@@ -61,6 +60,12 @@ def _find_nearest_opponent(drone, candidates):
 
 
 _ASSIGNMENT_CONFIG = None
+_OFFENSIVE_AVOID_SETTINGS = {
+    "enabled": True,
+    "low_altitude_threshold": 30.0,
+    "corridor_cells": 1,
+    "sample_count": 8,
+}
 
 
 def update_chase_strategy(drones, offensive_target_point, assignment_cfg=None, map_grid=None):
@@ -84,6 +89,33 @@ def update_chase_strategy(drones, offensive_target_point, assignment_cfg=None, m
             pass
     #先将无人机列表中的所有实例遍历, 将它们分为offensive和defensive两个列表
     # 进攻方：优先尝试轻量避障——若与目标在 XY 投影上不可直达，则用单体 A* 规划并追踪第一航点
+    def _needs_obstacle_aware_path(pos, target, grid) -> bool:
+        settings = _OFFENSIVE_AVOID_SETTINGS or {}
+        if not settings.get("enabled", True):
+            return False
+        low_alt = float(settings.get("low_altitude_threshold", 30.0))
+        if min(float(pos[2]), float(target[2])) > low_alt:
+            return False
+        if grid is None or not hasattr(grid, "world_to_grid") or not hasattr(grid, "obstacle_grid"):
+            return False
+        sample_count = max(2, int(settings.get("sample_count", 8)))
+        corridor = max(0, int(settings.get("corridor_cells", 1)))
+        dx = float(target[0]) - float(pos[0])
+        dy = float(target[1]) - float(pos[1])
+        for i in range(sample_count + 1):
+            t = i / sample_count
+            x = float(pos[0]) + dx * t
+            y = float(pos[1]) + dy * t
+            gx, gy = grid.world_to_grid(x, y)
+            for ox in range(-corridor, corridor + 1):
+                for oy in range(-corridor, corridor + 1):
+                    nx = gx + ox
+                    ny = gy + oy
+                    if 0 <= nx < grid.width and 0 <= ny < grid.height:
+                        if grid.obstacle_grid[nx, ny]:
+                            return True
+        return False
+
     for drone in offensive:
         used_light_plan = False
         if map_grid is not None:
@@ -95,8 +127,13 @@ def update_chase_strategy(drones, offensive_target_point, assignment_cfg=None, m
 
             try:
                 pos = tuple(drone.position[:3])
-                # 如果不可直达，尝试做一个快速单体 A* 规划
+                needs_plan = False
                 if line_of_sight_world is not None and not line_of_sight_world(pos, offensive_target_point, map_grid):
+                    needs_plan = True
+                if not needs_plan and _needs_obstacle_aware_path(pos, offensive_target_point, map_grid):
+                    needs_plan = True
+                # 如果不可直达或低空贴建筑，尝试做一个快速单体 A* 规划
+                if needs_plan:
                     if a_star_plan_world is not None:
                         path = a_star_plan_world(pos, offensive_target_point, map_grid, max_time_ms=50)
                         if path:
@@ -122,7 +159,12 @@ def update_chase_strategy(drones, offensive_target_point, assignment_cfg=None, m
 
         if assignment_cfg is None:
             assignment_cfg = ImprovedAuctionConfig()
-        assignment = greedy_assignment(defensive, offensive, config=assignment_cfg)  # 键是名字字符串
+        assignment = greedy_assignment(
+            defensive,
+            offensive,
+            config=assignment_cfg,
+            map_grid=map_grid,
+        )  # 键是名字字符串
         # 构建名字到防守方对象的映射
         name_to_defender = {d.name: d for d in defensive}
         # 将 assignment 转为 (defender_obj, goal_pos) 列表供 CBS 使用
@@ -215,14 +257,26 @@ def update_chase_strategy(drones, offensive_target_point, assignment_cfg=None, m
 def spawn_random_drone(config: dict, drones: list) -> None:
     #根据当前进攻方无人机数量随机生成1~2架新的进攻方无人机, 生成位置在地图左侧(-450~450, -400~400, 100), 类型随机为attack或tank
     offensive = [d for d in drones if _is_offensive(d) and d.is_alive()]
-    max_offensive = int(config.get("simulation", {}).get("max_offensive", 6))
+    sim_cfg = config.get("simulation", {})
+    max_offensive = int(sim_cfg.get("max_offensive", 6))
     if len(offensive) >= max_offensive:
         return
+    low_min = float(sim_cfg.get("offensive_spawn_z_low_min", 5.0))
+    low_max = float(sim_cfg.get("offensive_spawn_z_low_max", 30.0))
+    high_min = float(sim_cfg.get("offensive_spawn_z_high_min", 80.0))
+    high_max = float(sim_cfg.get("offensive_spawn_z_high_max", 160.0))
+    high_ratio = float(sim_cfg.get("offensive_spawn_high_ratio", 0.5))
+    low_min, low_max = sorted((low_min, low_max))
+    high_min, high_max = sorted((high_min, high_max))
     # 小规模仿真默认每次仅生成 1 架
     for _ in range(random.randint(1, 1)):
         drone_type = random.choice(["attack", "tank"])
         if drone_type in {"attack", "tank"}:
-            position = [random.uniform(-450, 450), random.uniform(-400, 400), 100]
+            if random.random() < max(0.0, min(1.0, high_ratio)):
+                z = random.uniform(high_min, high_max)
+            else:
+                z = random.uniform(low_min, low_max)
+            position = [random.uniform(-450, 450), random.uniform(-400, 400), z]
         name = f"{drone_type.capitalize()}-{random.randint(100,999)}"
         # 调用对应的生成函数，它们内部会执行 drones.append(drone)
         if drone_type == "attack":
@@ -278,13 +332,19 @@ def run_simulation(config: dict):
     """运行仿真主循环"""
     global _ASSIGNMENT_CONFIG
     _ASSIGNMENT_CONFIG = _build_assignment_config(config)
+    sim_cfg = config.get("simulation", {})
+    global _OFFENSIVE_AVOID_SETTINGS
+    _OFFENSIVE_AVOID_SETTINGS = {
+        "enabled": bool(sim_cfg.get("offensive_obstacle_avoid", True)),
+        "low_altitude_threshold": float(sim_cfg.get("offensive_avoid_low_alt_threshold", 30.0)),
+        "corridor_cells": int(sim_cfg.get("offensive_avoid_corridor_cells", 1)),
+        "sample_count": int(sim_cfg.get("offensive_avoid_sample_count", 8)),
+    }
 
     drones = create_drone_team(config)
     #创建无人机初始团队
     base_manager = BaseManager(config)
     #创建基地管理器实例, 从配置中读取基地的相关参数
-    radar = RadarSensor(range_m=config["radar"]["range"], pulse_interval=config["radar"]["pulse_interval"])
-    #创建雷达传感器实例, 从配置中读取range_m和pulse_interval
     display = None
     if Open3DDisplay is not None:
         try:
@@ -377,8 +437,8 @@ def run_simulation(config: dict):
             #10. 平衡防守方数量
             balance_defenders(config, drones) #每帧立即平衡防守方数量, 直到防守方数量 >= 进攻方数量"""
 
-            detections = radar.scan(alive_drones)
-            #雷达扫描一次所有存活的无人机 """
+            detections = []
+            #雷达模块已移除，进攻方目标全局可知
             LOGGER.debug("Detected %d objects", len(detections))
             if display is not None:
                 display.update(drones, detections, base_manager.get_health(), base_position)

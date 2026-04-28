@@ -314,6 +314,14 @@ class Open3DDisplay:
         self.window.post_redraw()
 
     def close_window(self):
-        if self.is_open:
+        if not self.is_open:
+            return
+        try:
             self.window.close()
+        finally:
             self.is_open = False
+        try:
+            # Ensure the GUI thread shuts down before interpreter finalizes.
+            self.app.quit()
+        except Exception:
+            pass

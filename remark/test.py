@@ -148,7 +148,12 @@ def update_strategy_and_measure(
     assigned_pairs = 0
     if offensive and defensive:
         t0 = time.perf_counter()
-        assignment = greedy_assignment(defensive, offensive, config=assignment_cfg)
+        assignment = greedy_assignment(
+            defensive,
+            offensive,
+            config=assignment_cfg,
+            map_grid=map_grid,
+        )
         assignment_cost_ms = (time.perf_counter() - t0) * 1000.0
 
         defenders_by_name = {d.name: d for d in defensive}
