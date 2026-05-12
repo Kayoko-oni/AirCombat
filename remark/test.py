@@ -8,7 +8,7 @@ import json
 import random
 import sys
 import time
-from dataclasses import fields
+from dataclasses import fields, replace
 from datetime import datetime
 from pathlib import Path
 from statistics import mean
@@ -28,6 +28,8 @@ from algorithms.auction_assign import ImprovedAuctionConfig, greedy_assignment
 from algorithms.cbs_pathplan import cbs_plan_paths
 from utils.map_loader import generate_buildings
 from utils.map_grid import MapGrid
+from utils.map_loader import generate_buildings
+from utils.map_grid import MapGrid
 from drones.factory import (
     create_attack_drone,
     create_drone_team,
@@ -44,6 +46,26 @@ def load_config(config_path: Path) -> Dict[str, Any]:
 
 def is_offensive(drone: Any) -> bool:
     return getattr(drone, "drone_type", "") in {"AttackDrone", "TankDrone"}
+
+
+def _distance_3d(a: Any, b: Any) -> float:
+    pa = getattr(a, "position", a)
+    pb = getattr(b, "position", b)
+    return sum((x - y) ** 2 for x, y in zip(pa[:3], pb[:3])) ** 0.5
+
+
+def _fallback_assignment(defensive: List[Any], offensive: List[Any]) -> Dict[str, Optional[Any]]:
+    assignment: Dict[str, Optional[Any]] = {d.name: None for d in defensive}
+    if not offensive:
+        return assignment
+    remaining = set(range(len(offensive)))
+    for defender in defensive:
+        if not remaining:
+            break
+        best_idx = min(remaining, key=lambda idx: _distance_3d(defender, offensive[idx]))
+        assignment[defender.name] = offensive[best_idx]
+        remaining.remove(best_idx)
+    return assignment
 
 
 def build_assignment_config(config: Dict[str, Any]) -> ImprovedAuctionConfig:
@@ -148,7 +170,31 @@ def update_strategy_and_measure(
     assigned_pairs = 0
     if offensive and defensive:
         t0 = time.perf_counter()
-        assignment = greedy_assignment(defensive, offensive, config=assignment_cfg)
+        try:
+            assignment = greedy_assignment(
+                defensive,
+                offensive,
+                config=assignment_cfg,
+                map_grid=map_grid,
+            )
+        except RuntimeError as exc:
+            if "did not converge" in str(exc):
+                retry_cfg = replace(
+                    assignment_cfg,
+                    max_iterations_per_phase=int(assignment_cfg.max_iterations_per_phase * 3),
+                )
+                try:
+                    assignment = greedy_assignment(
+                        defensive,
+                        offensive,
+                        config=retry_cfg,
+                        map_grid=map_grid,
+                    )
+                except RuntimeError:
+                    print("[WARN] assignment did not converge; using fallback matcher")
+                    assignment = _fallback_assignment(defensive, offensive)
+            else:
+                raise
         assignment_cost_ms = (time.perf_counter() - t0) * 1000.0
 
         defenders_by_name = {d.name: d for d in defensive}
