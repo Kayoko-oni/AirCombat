@@ -4,6 +4,7 @@ from dataclasses import fields
 from pathlib import Path
 
 import yaml
+import os
 
 from Controller.collision_handler import detect_collisions, resolve_collisions
 from drones.offensive.attack_drone import AttackDrone
@@ -255,35 +256,32 @@ def update_chase_strategy(drones, offensive_target_point, assignment_cfg=None, m
 #=================暂行无人机生成策略，之后要被任务分配算法替代============================================
 
 def spawn_random_drone(config: dict, drones: list) -> None:
-    #根据当前进攻方无人机数量随机生成1~2架新的进攻方无人机, 生成位置在地图左侧(-450~450, -400~400, 100), 类型随机为attack或tank
     offensive = [d for d in drones if _is_offensive(d) and d.is_alive()]
     sim_cfg = config.get("simulation", {})
     max_offensive = int(sim_cfg.get("max_offensive", 6))
     if len(offensive) >= max_offensive:
         return
-    low_min = float(sim_cfg.get("offensive_spawn_z_low_min", 5.0))
-    low_max = float(sim_cfg.get("offensive_spawn_z_low_max", 30.0))
-    high_min = float(sim_cfg.get("offensive_spawn_z_high_min", 80.0))
-    high_max = float(sim_cfg.get("offensive_spawn_z_high_max", 160.0))
-    high_ratio = float(sim_cfg.get("offensive_spawn_high_ratio", 0.5))
-    low_min, low_max = sorted((low_min, low_max))
-    high_min, high_max = sorted((high_min, high_max))
-    # 小规模仿真默认每次仅生成 1 架
-    for _ in range(random.randint(1, 1)):
-        drone_type = random.choice(["attack", "tank"])
-        if drone_type in {"attack", "tank"}:
-            if random.random() < max(0.0, min(1.0, high_ratio)):
-                z = random.uniform(high_min, high_max)
-            else:
-                z = random.uniform(low_min, low_max)
-            position = [random.uniform(-450, 450), random.uniform(-400, 400), z]
-        name = f"{drone_type.capitalize()}-{random.randint(100,999)}"
-        # 调用对应的生成函数，它们内部会执行 drones.append(drone)
-        if drone_type == "attack":
-            create_attack_drone(name, position, config, drones)
-        elif drone_type == "tank":
-            create_tank_drone(name, position, config, drones)
-        # 注意：这里不需要再手动 drones.append()
+    z = random.uniform(200.0, 250.0)
+    direction = random.choice(['top', 'bottom', 'left', 'right'])
+    if direction == 'top':
+        x = random.uniform(-500, 500)
+        y = random.uniform(520, 550)
+    elif direction == 'bottom':
+        x = random.uniform(-500, 500)
+        y = random.uniform(-550, -520)
+    elif direction == 'left':
+        x = random.uniform(-550, -520)
+        y = random.uniform(-500, 500)
+    else:  # right
+        x = random.uniform(520, 550)
+        y = random.uniform(-500, 500)
+    position = [x, y, z]
+    drone_type = random.choice(["attack", "tank"])
+    name = f"{drone_type.capitalize()}-{random.randint(100,999)}"
+    if drone_type == "attack":
+        create_attack_drone(name, position, config, drones)
+    elif drone_type == "tank":
+        create_tank_drone(name, position, config, drones)
 
 def balance_defenders(config: dict, drones: list) -> None:
     """立即平衡防守方数量，直到防守方数量 >= 进攻方数量"""
@@ -341,7 +339,7 @@ def run_simulation(config: dict):
         "sample_count": int(sim_cfg.get("offensive_avoid_sample_count", 8)),
     }
 
-    drones = create_drone_team(config)
+    drones = []
     #创建无人机初始团队
     base_manager = BaseManager(config)
     #创建基地管理器实例, 从配置中读取基地的相关参数
@@ -349,18 +347,17 @@ def run_simulation(config: dict):
     display = None
     if Open3DDisplay is not None:
         try:
-            display = Open3DDisplay(map_size=(config["map"]["width"], config["map"]["height"]))
+            obj_model_path = str(Path(__file__).resolve().parent / "Data" / "maps" / "3d66.com_JJI54558918189.obj")
+            if os.path.exists(obj_model_path):
+                display = Open3DDisplay(map_size=(config["map"]["width"], config["map"]["height"]),
+                                        obj_model_path=obj_model_path)
+            else:
+                display = Open3DDisplay(map_size=(config["map"]["width"], config["map"]["height"]))
             display.open_window()
-            # 提前初始化地图数据，使 display.map_grid 在仿真第一帧就可用
-            try:
-                display._init_map_data()
-            except Exception:
-                # 若初始化失败（应当不会），在后续 display.update() 时会再次尝试
-                pass
+            display._init_map_data()
         except Exception as exc:
             LOGGER.warning("Open3D initialization failed, running headless: %s", exc)
             display = None
-    #尝试创建open3d窗口
 
     fps = config["simulation"]["fps"]
     frame_time = 1.0 / fps
@@ -406,11 +403,8 @@ def run_simulation(config: dict):
             drones = [d for d in drones if not d.should_remove()]
             #剔除drones列表中所有被 .should_move函数判断为"应该被移除"的无人机, 即更新drone列表"""
 
-            #5.获取存活无人机列表, 如果没有存活的无人机了, 输出到日志, 结束仿真
+            #5.获取存活无人机列表
             alive_drones = [d for d in drones if not d.destroyed]
-            if not alive_drones:
-                LOGGER.info("All active drones destroyed, ending simulation.")
-                break
 
             #6. 更新存活无人机的追逐策略
             # 将 display.map_grid 传入路径规划模块；若 display 不存在则传入 None

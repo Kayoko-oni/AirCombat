@@ -2,6 +2,9 @@ from typing import List
 import numpy as np
 
 import yaml
+import os
+from utils.obj_voxelizer import voxelize_obj
+from utils.map_grid import MapGrid
 
 from utils.map_loader import generate_buildings
 from drones.base_drone import BaseDrone
@@ -16,7 +19,7 @@ from Visual.render_utils import (
 
 
 class Open3DDisplay:
-    def __init__(self, map_size=(1000, 1000)):
+    def __init__(self, map_size=(1000, 1000), obj_model_path=None):
         try:
             import open3d as o3d
             from open3d.visualization import gui, rendering
@@ -54,6 +57,9 @@ class Open3DDisplay:
         self.static_objects_added = False      # 静态物体是否已添加
         self.dynamic_geometries = set()        # 存储动态几何体的名称
         self.map_initialized = False           # 地图是否已初始化（用于首次更新时添加建筑）
+
+        self.obj_model_path = obj_model_path
+        self.city_mesh = None
 
         self.map_data_initialized = False   # 地图数据是否已生成
         self.buildings = None               # 建筑列表
@@ -122,52 +128,43 @@ class Open3DDisplay:
         self.scene_widget.scene.add_geometry("base_model", base_mesh, material)
         
 
+    def _add_buildings(self):
+        if self.city_mesh is not None:
+            material = self.rendering.MaterialRecord()
+            material.shader = 'defaultLit'
+            material.base_color = (0.7, 0.7, 0.7, 1.0)
+            self.scene_widget.scene.add_geometry("city_buildings", self.city_mesh, material)
+            print("[Map] 显示 OBJ 城市模型")
+        elif self.buildings is not None:
+            combined = self.o3d.geometry.TriangleMesh()
+            for center, size in self.buildings:
+                cx, cy, cz = center
+                sx, sy, sz = size
+                box = self.o3d.geometry.TriangleMesh.create_box(width=sx, height=sy, depth=sz)
+                box.translate([cx - sx/2, cy - sy/2, cz - sz/2])
+                box.paint_uniform_color((0.8, 0.8, 0.8))
+                combined += box
+            combined.compute_vertex_normals()
+            material = self.rendering.MaterialRecord()
+            material.shader = 'defaultLit'
+            material.base_color = (0.8, 0.8, 0.8, 0.92)
+            self.scene_widget.scene.add_geometry("city_buildings", combined, material)
+            print(f"[Map] 显示随机建筑: {len(self.buildings)} 个立方体")
+            
     def _init_map_data(self):
-        """生成建筑列表和障碍物网格（只执行一次）"""
         if self.map_data_initialized:
             return
-        from utils.map_loader import generate_buildings
-        from utils.map_grid import MapGrid
-        self.buildings = generate_buildings()
-        self.map_grid = MapGrid(self.buildings, cell_size=5.0)
+        if self.obj_model_path and os.path.exists(self.obj_model_path):
+            mesh, obs_grid, obs_height, cell_size, bounds = voxelize_obj(self.obj_model_path)
+            self.city_mesh = mesh
+            self.map_grid = MapGrid.from_arrays(obs_grid, obs_height, cell_size, bounds)
+            print(f"[Map] 使用 OBJ 模型体素化，网格 {obs_grid.shape}")
+        else:
+            from utils.map_loader import generate_buildings
+            self.buildings = generate_buildings()
+            self.map_grid = MapGrid(self.buildings, cell_size=5.0)
+            print("[Map] 使用随机生成建筑")
         self.map_data_initialized = True
-        print(f"Map data initialized: {len(self.buildings)} buildings, grid size {self.map_grid.width}x{self.map_grid.height}")
-        # ===================================测试代码，验证网格是否被正确标记，路径规划确认读取无误后可以删除======================================================
-        if self.map_grid is not None and self.buildings:
-            # 1. 取第一个建筑的中心点，应被标记为障碍物
-            cx, cy, _ = self.buildings[0][0]
-            occupied = self.map_grid.is_occupied(cx, cy)
-            print(f"验证1: 第一个建筑中心 ({cx:.1f},{cy:.1f}) 是否被障碍物网格标记？ {occupied} (预期 True)")
-
-            # 2. 取一个明显空闲的点，例如 (400, 400)
-            free_x, free_y = 400, 400
-            occupied_free = self.map_grid.is_occupied(free_x, free_y)
-            print(f"验证2: 空闲点 ({free_x},{free_y}) 是否被障碍物网格标记？ {occupied_free} (预期 False)")
-
-            # 3. 打印网格中障碍物比例
-            total_cells = self.map_grid.width * self.map_grid.height
-            occupied_cells = np.sum(self.map_grid.obstacle_grid)
-            print(f"网格尺寸: {self.map_grid.width}x{self.map_grid.height}, 障碍物比例: {occupied_cells}/{total_cells} ({100*occupied_cells/total_cells:.1f}%)")
-        #======================================================================================================================================================
-
-    def _add_buildings(self):
-        """将建筑列表转换为单个网格并添加到场景"""
-        if self.buildings is None:
-            return
-        combined = self.o3d.geometry.TriangleMesh()
-        for center, size in self.buildings:
-            cx, cy, cz = center
-            sx, sy, sz = size
-            box = self.o3d.geometry.TriangleMesh.create_box(width=sx, height=sy, depth=sz)
-            box.translate([cx - sx / 2, cy - sy / 2, cz - sz / 2])
-            box.paint_uniform_color((0.8, 0.8, 0.8))
-            combined += box
-        combined.compute_vertex_normals()
-        material = self.rendering.MaterialRecord()
-        material.shader = 'defaultLit'
-        material.base_color = (0.8, 0.8, 0.8, 0.92)
-        self.scene_widget.scene.add_geometry("city_buildings", combined, material)
-        print(f"Buildings displayed: {len(self.buildings)}")
 
     def _on_layout(self, layout_context):
         r = self.window.content_rect

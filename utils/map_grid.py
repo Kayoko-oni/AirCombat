@@ -128,3 +128,10 @@ class MapGrid:
                 if h > max_h:
                     max_h = float(h)
         return max_h
+    
+    @classmethod
+    def from_arrays(cls, obstacle_grid, obstacle_height, cell_size, bounds):
+        mg = cls([], cell_size=cell_size, bounds=bounds)
+        mg.obstacle_grid = obstacle_grid
+        mg.obstacle_height = obstacle_height
+        return mg
