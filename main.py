@@ -261,7 +261,7 @@ def spawn_random_drone(config: dict, drones: list) -> None:
     max_offensive = int(sim_cfg.get("max_offensive", 6))
     if len(offensive) >= max_offensive:
         return
-    z = random.uniform(200.0, 250.0)
+    z = random.uniform(100.0, 250.0)
     direction = random.choice(['top', 'bottom', 'left', 'right'])
     if direction == 'top':
         x = random.uniform(-500, 500)

@@ -2,7 +2,7 @@ import open3d as o3d
 import numpy as np
 
 def voxelize_obj(obj_path, target_extent=1000.0, voxel_size=20.0,
-                 map_bounds=(-500, -500, 500, 500), z_up_offset=120.0):
+                 map_bounds=(-600, -600, 600, 600), z_up_offset=120.0):
     mesh = o3d.io.read_triangle_mesh(obj_path)
     mesh.compute_vertex_normals()
     # 旋转 Y->Z

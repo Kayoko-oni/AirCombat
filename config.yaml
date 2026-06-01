@@ -12,7 +12,7 @@ map:
   # TODO: 添加边界定义和障碍物
 base:
   health: 100
-  position: [75, 75, 0]
+  position: [-10, -25, 0]
   collision_radius: 12.5
 
 simulation:

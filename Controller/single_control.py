@@ -24,7 +24,7 @@ def move_drone(drone: BaseDrone, delta_time: float) -> None:
     if not drone.is_alive():
         return
     drone.update_position(delta_time)
-    drone.position = clamp_position(drone.position, (-500, -500, 0), (500, 500, 100))
+    drone.position = clamp_position(drone.position, (-600, -600, 0), (600, 600, 350))
     # TODO: 使边界限制可配置而非硬编码
     
     #移动目标无人机
