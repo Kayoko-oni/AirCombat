@@ -3,8 +3,11 @@
 
 from drones.offensive.attack_drone import AttackDrone
 from drones.offensive.tank_drone import TankDrone
+from drones.offensive.anti_radiation_drone import AntiRadiationDrone
+from drones.offensive.ew_drone import EWDrone
 from drones.defensive.scout_drone import ScoutDrone
 from drones.defensive.interceptor_drone import InterceptorDrone
+from drones.defensive.anti_ew_drone import AntiEWDrone
 
 
 def create_attack_drone(name: str, position: list, config: dict, drones: list) -> None:
@@ -16,6 +19,30 @@ def create_attack_drone(name: str, position: list, config: dict, drones: list) -
 def create_tank_drone(name: str, position: list, config: dict, drones: list) -> None:
     """创建一架肉盾机并直接加入 drones 列表, 参数为: name 位置坐标列表 config 要添加到的目标无人机列表(总列表为drones) """
     drone = TankDrone(name=name, position=position, config=config["drones"]["tank"])
+    drones.append(drone)
+
+
+def create_anti_radiation_drone(name: str, position: list, config: dict, drones: list) -> None:
+    """创建一架反辐射无人机并直接加入 drones 列表，同时初始化屏蔽方向"""
+    drone_config = config.get("drones", {}).get("anti_radiation", {})
+    drone = AntiRadiationDrone(name=name, position=position, config=drone_config)
+    # 固化屏蔽方向：从基地指向初始位置
+    base_pos = config.get("base", {}).get("position", [0.0, 0.0, 0.0])
+    drone.init_jamming_direction(base_pos)
+    drones.append(drone)
+
+
+def create_ew_drone(name: str, position: list, config: dict, drones: list) -> None:
+    """创建一架电子战无人机并直接加入 drones 列表"""
+    drone_config = config.get("drones", {}).get("ew", {})
+    drone = EWDrone(name=name, position=position, config=drone_config)
+    drones.append(drone)
+
+
+def create_anti_ew_drone(name: str, position: list, config: dict, drones: list) -> None:
+    """创建一架反电子战无人机并直接加入 drones 列表"""
+    drone_config = config.get("drones", {}).get("anti_ew", {})
+    drone = AntiEWDrone(name=name, position=position, config=drone_config)
     drones.append(drone)
 
 

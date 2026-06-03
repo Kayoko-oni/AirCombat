@@ -1,3 +1,4 @@
+import math
 import random
 import time
 from dataclasses import fields
@@ -6,12 +7,19 @@ from pathlib import Path
 import yaml
 import os
 
-from Controller.collision_handler import detect_collisions, resolve_collisions
+from Controller.collision_handler import detect_collisions, resolve_collisions, is_offensive_type
 from drones.offensive.attack_drone import AttackDrone
 from drones.offensive.tank_drone import TankDrone
+from drones.offensive.anti_radiation_drone import AntiRadiationDrone
+from drones.offensive.ew_drone import EWDrone
 from drones.defensive.scout_drone import ScoutDrone
 from drones.defensive.interceptor_drone import InterceptorDrone
-from drones.factory import create_drone_team, create_attack_drone, create_tank_drone, create_interceptor_drone, create_scout_drone
+from drones.defensive.anti_ew_drone import AntiEWDrone
+from drones.factory import (
+    create_drone_team, create_attack_drone, create_tank_drone,
+    create_anti_radiation_drone, create_ew_drone, create_anti_ew_drone,
+    create_interceptor_drone, create_scout_drone,
+)
 from Controller.single_control import chase_target, chase_point, move_drone
 from utils.logger import get_logger
 from base.base_manager import BaseManager
@@ -37,7 +45,7 @@ def load_config(path: Path) -> dict:
 
 def _is_offensive(drone):
     """ 判断无人机是否是进攻方"""
-    return drone.drone_type in {"AttackDrone", "TankDrone"}
+    return is_offensive_type(drone.drone_type)
 
 
 def _find_nearest_opponent(drone, candidates):
@@ -68,20 +76,171 @@ _OFFENSIVE_AVOID_SETTINGS = {
     "sample_count": 8,
 }
 
+# ---------------------------------------------------------------------------
+# 电子战 (EW) 干扰相关工具
+# ---------------------------------------------------------------------------
 
-def update_chase_strategy(drones, offensive_target_point, assignment_cfg=None, map_grid=None):
+def _get_ew_drones(drones: list):
+    """返回所有存活且干扰激活的电子战无人机。"""
+    return [
+        d for d in drones
+        if isinstance(d, EWDrone) and d.jamming_active and d.is_alive()
+    ]
+
+
+def _apply_ew_jamming(drones: list, ew_drones: list) -> None:
+    """每帧根据 EW 无人机的位置标记防守方是否被干扰。
+
+    被干扰的防守方：_ew_jammed = True，不参与任务分配且路径规划慢速。
+    AntiEWDrone 不受 EW 干扰影响。
+    """
+    for d in drones:
+        # 只标记防守方（非进攻方），且 AntiEWDrone 免疫
+        if is_offensive_type(d.drone_type) or isinstance(d, AntiEWDrone):
+            d._ew_jammed = False
+            continue
+        if not d.is_alive():
+            d._ew_jammed = False
+            continue
+        jammed = False
+        for ew in ew_drones:
+            if ew.is_in_jamming_range(d.position):
+                jammed = True
+                break
+        d._ew_jammed = jammed
+
+
+def _check_anti_ew_disruption(ew_drones: list, anti_ew_drones: list) -> None:
+    """检查反电子战无人机是否靠近 EW 无人机，靠近则永久关闭其干扰。"""
+    for aew in anti_ew_drones:
+        if not aew.is_alive():
+            continue
+        for ew in ew_drones:
+            if not ew.jamming_active:
+                continue
+            dist = sum((p - q) ** 2 for p, q in zip(aew.position, ew.position)) ** 0.5
+            if dist <= aew.disruption_radius:
+                ew.disable_jamming()
+                LOGGER.info(
+                    "AntiEW %s disabled EW %s jamming (dist=%.1f)",
+                    aew.name, ew.name, dist,
+                )
+
+
+def _spawn_anti_ew_if_needed(config: dict, drones: list, base_position: list):
+    """当存在活跃 EW 无人机且无 AntiEW 正在追击时，在基地生成一架 AntiEW。"""
+    ew_drones = _get_ew_drones(drones)
+    if not ew_drones:
+        return
+    existing_anti_ew = [
+        d for d in drones
+        if isinstance(d, AntiEWDrone) and d.is_alive()
+    ]
+    # 最多生成与活跃 EW 数量相同的 AntiEW
+    needed = len(ew_drones) - len(existing_anti_ew)
+    if needed <= 0:
+        return
+    for _ in range(needed):
+        name = f"AntiEW-{random.randint(100, 999)}"
+        # 在基地位置生成
+        create_anti_ew_drone(name, [base_position[0], base_position[1], 50.0], config, drones)
+        LOGGER.info("Spawned AntiEW drone: %s at base", name)
+
+
+# ====== 以下为原有 ARD 感知屏蔽工具 ======
+
+def _get_jammers(drones: list):
+    """返回所有存活且屏蔽已初始化的反辐射无人机。"""
+    return [
+        d for d in drones
+        if isinstance(d, AntiRadiationDrone) and d.jamming_active
+    ]
+
+
+def _is_visible_to_defense(drone, base_position: list, jammers: list) -> bool:
+    """进攻方无人机是否对防守方可见（不在屏蔽扇区内）。"""
+    if not jammers:
+        return True
+    for jammer in jammers:
+        if jammer.is_in_jammed_sector(drone.position, base_position):
+            return False
+    return True
+
+
+def _get_jammed_directions(jammers: list) -> list:
+    """返回所有活跃屏蔽方向（弧度），去重。"""
+    directions = []
+    for j in jammers:
+        if j.jamming_direction is not None:
+            rounded = round(j.jamming_direction, 2)
+            if rounded not in directions:
+                directions.append(rounded)
+    return directions
+
+
+def _dispatch_defenders_to_jammed_directions(
+    defensive: list,
+    jammers: list,
+    base_position: list,
+    map_grid=None,
+) -> None:
+    """向每个活跃屏蔽方向派遣 1 侦察 + 1 拦截（从无分配目标的防守方中选取）。"""
+    if not jammers:
+        return
+    directions = _get_jammed_directions(jammers)
+    if not directions:
+        return
+    unassigned = [
+        d for d in defensive
+        if d.is_alive() and getattr(d, "_assigned_target", None) is None
+    ]
+    if not unassigned:
+        return
+    scouts = [d for d in unassigned if isinstance(d, ScoutDrone)]
+    interceptors = [d for d in unassigned if isinstance(d, InterceptorDrone)]
+    for direction in directions:
+        target_x = base_position[0] + 300.0 * math.cos(direction)
+        target_y = base_position[1] + 300.0 * math.sin(direction)
+        target_point = [target_x, target_y, 30.0]
+        if scouts:
+            scout = scouts.pop(0)
+            scout._assigned_target = None
+            chase_point(scout, target_point, map_grid=map_grid)
+        if interceptors:
+            interceptor = interceptors.pop(0)
+            interceptor._assigned_target = None
+            chase_point(interceptor, target_point, map_grid=map_grid)
+
+
+def update_chase_strategy(drones, offensive_target_point, assignment_cfg=None, map_grid=None, base_position=None):
     """输入一个无人机实例列表, 让防守方追击根据任务分配得到的目标进攻方, 进攻方追击传入的offensive_target_point
 
     参数说明：
     - drones: 无人机实例列表
-    - offensive_target_point: 进攻方的公共目标点
+    - offensive_target_point: 进攻方的公共目标点(即基地坐标)
     - assignment_cfg: 任务分配配置
-    - map_grid: 可选的 MapGrid 实例（来自 display.map_grid）。若提供则尝试使用 CBS 进行二维路径规划，输出为每架防守方的下一步航点。
+    - map_grid: 可选的 MapGrid 实例。若提供则尝试使用 CBS 进行二维路径规划
+    - base_position: 基地坐标 [x,y,z]，用于感知屏蔽计算（屏蔽扇区原点 + 防守方派遣起点）
 
     兼容性：当 map_grid 为 None 时，退化为原有的直接追逐逻辑。
     """
+    if base_position is None:
+        base_position = [0.0, 0.0, 0.0]
+
     offensive = [d for d in drones if _is_offensive(d) and d.is_alive()]
     defensive = [d for d in drones if not _is_offensive(d) and d.is_alive()]
+
+    # 收集活跃反辐射无人机
+    jammers = _get_jammers(drones)
+    # 收集活跃电子战干扰无人机
+    ew_drones = _get_ew_drones(drones)
+
+    # 应用 EW 干扰（标记防守方 _ew_jammed）
+    _apply_ew_jamming(drones, ew_drones)
+    # 检查 AntiEW 是否靠近 EW无人机并关闭干扰
+    anti_ew_drones_list = [d for d in drones if isinstance(d, AntiEWDrone) and d.is_alive()]
+    _check_anti_ew_disruption(ew_drones, anti_ew_drones_list)
+
     # 清理之前的分配标记
     for dd in defensive:
         try:
@@ -117,7 +276,29 @@ def update_chase_strategy(drones, offensive_target_point, assignment_cfg=None, m
                             return True
         return False
 
+    # ---------- TankDrone 护卫 EW 无人机 ----------
+    escorted_tanks = []
+    if ew_drones:
+        # 尚未被护卫的 EW 列表
+        ew_needing_escort = list(ew_drones)
+        tank_drones_list = [d for d in offensive if isinstance(d, TankDrone)]
+        for tank in tank_drones_list:
+            if not ew_needing_escort:
+                break
+            nearest_ew = min(ew_needing_escort,
+                             key=lambda ew: sum((p - q) ** 2 for p, q in zip(tank.position, ew.position)))
+            dist_to_ew = sum((p - q) ** 2 for p, q in zip(tank.position, nearest_ew.position)) ** 0.5
+            if dist_to_ew <= nearest_ew.jamming_radius * 1.5:
+                # Tank 跟随 EW 而非冲基地
+                chase_target(tank, nearest_ew, map_grid=map_grid)
+                tank._escorting_ew = nearest_ew
+                escorted_tanks.append(tank)
+                ew_needing_escort.remove(nearest_ew)
+
     for drone in offensive:
+        # 已在护卫 EW 的 Tank 跳过常规逻辑
+        if drone in escorted_tanks:
+            continue
         used_light_plan = False
         if map_grid is not None:
             try:
@@ -133,7 +314,6 @@ def update_chase_strategy(drones, offensive_target_point, assignment_cfg=None, m
                     needs_plan = True
                 if not needs_plan and _needs_obstacle_aware_path(pos, offensive_target_point, map_grid):
                     needs_plan = True
-                # 如果不可直达或低空贴建筑，尝试做一个快速单体 A* 规划
                 if needs_plan:
                     if a_star_plan_world is not None:
                         path = a_star_plan_world(pos, offensive_target_point, map_grid, max_time_ms=50)
@@ -142,7 +322,6 @@ def update_chase_strategy(drones, offensive_target_point, assignment_cfg=None, m
                                 drone._avoid_path = path
                                 drone._avoid_idx = 1 if len(path) > 1 else 0
                                 next_wp = path[drone._avoid_idx]
-                                # 直接追踪第一个航点（map_grid=None 以避免再次触发规划器）
                                 chase_point(drone, next_wp, map_grid=None)
                                 used_light_plan = True
                             except Exception:
@@ -152,23 +331,62 @@ def update_chase_strategy(drones, offensive_target_point, assignment_cfg=None, m
 
         if not used_light_plan:
             chase_point(drone, offensive_target_point, map_grid=map_grid)
-    #遍历进攻方无人机列表, 将每个无人机的目标设置为地图原点（基地）,
-    #如果确认该目标存活, 则调用Controller——single_control——chase_target函数, 使其向目标无人机的位置运动
 
-    if offensive and defensive:
+    # -------- 防守方行为 --------
+    if not defensive:
+        return
+
+    # EW 干扰：分离未受干扰和受干扰的防守方
+    jammed_defenders = [d for d in defensive if getattr(d, '_ew_jammed', False)]
+    free_defenders = [d for d in defensive if not getattr(d, '_ew_jammed', False)]
+    # AntiEW 无人机不参与常规任务分配（它们已经指定追击 EW）
+    free_defenders = [d for d in free_defenders if not isinstance(d, AntiEWDrone)]
+
+    # 被 EW 干扰的拦截机：强迫追击最近 EW 无人机（重点摧毁）
+    for jd in list(jammed_defenders):
+        if isinstance(jd, InterceptorDrone) and ew_drones:
+            nearest_ew = min(ew_drones,
+                             key=lambda ew: sum((p - q) ** 2 for p, q in zip(jd.position, ew.position)))
+            jd._assigned_target = nearest_ew
+            chase_target(jd, nearest_ew, map_grid=map_grid)
+            jammed_defenders.remove(jd)
+        else:
+            # 其他被干扰防守方暂时减速（停在原地）
+            jd.set_velocity([0.0, 0.0, 0.0])
+
+    # AntiEW 无人机：追击最近的 EW 无人机（免疫干扰）
+    for aew in anti_ew_drones_list:
+        if aew.is_alive() and ew_drones:
+            nearest_ew = min(ew_drones,
+                             key=lambda ew: sum((p - q) ** 2 for p, q in zip(aew.position, ew.position)))
+            chase_target(aew, nearest_ew, map_grid=map_grid)
+
+    # 筛选防守方"可见"的进攻方（屏蔽扇区内不可见，反辐射自身不参与分配）
+    visible_offensive = [
+        d for d in offensive
+        if not isinstance(d, AntiRadiationDrone) and _is_visible_to_defense(d, base_position, jammers)
+    ]
+
+    # 拦截机优先分配 EW 无人机（干扰加权）
+    if visible_offensive and free_defenders:
         from algorithms.auction_assign import ImprovedAuctionConfig, greedy_assignment
 
         if assignment_cfg is None:
             assignment_cfg = ImprovedAuctionConfig()
+        # 构建 jammed_mask 传入拍卖（双重保险：即使 jammed defender 误入 free_defenders）
+        import numpy as np
+        _jammed = np.zeros(len(free_defenders), dtype=bool)
+        for _i, _d in enumerate(free_defenders):
+            if getattr(_d, '_ew_jammed', False):
+                _jammed[_i] = True
         assignment = greedy_assignment(
-            defensive,
-            offensive,
+            free_defenders,
+            visible_offensive,
             config=assignment_cfg,
             map_grid=map_grid,
-        )  # 键是名字字符串
-        # 构建名字到防守方对象的映射
-        name_to_defender = {d.name: d for d in defensive}
-        # 将 assignment 转为 (defender_obj, goal_pos) 列表供 CBS 使用
+            jammed_mask=_jammed if _jammed.any() else None,
+        )
+        name_to_defender = {d.name: d for d in free_defenders}
         pairs = []
         defenders_order = []
         for def_name, target in assignment.items():
@@ -176,8 +394,6 @@ def update_chase_strategy(drones, offensive_target_point, assignment_cfg=None, m
             if defender is None:
                 continue
             if target is not None:
-                # 目标可以是一个无人机实例，取其当前世界位置作为规划目标
-                # 记录分配给 defender 的目标对象，供可视化使用
                 try:
                     defender._assigned_target = target
                 except Exception:
@@ -187,34 +403,27 @@ def update_chase_strategy(drones, offensive_target_point, assignment_cfg=None, m
                     pairs.append((defender, goal_pos))
                     defenders_order.append(defender)
                 else:
-                    # 无法解析目标，退回到直接追踪
                     chase_target(defender, target)
             else:
-                # 没有分配目标，清除标记并停在原地
                 try:
                     defender._assigned_target = None
                 except Exception:
                     pass
                 defender.set_velocity([0.0, 0.0, 0.0])
 
-        # 如果提供了地图，则调用 CBS 进行批量路径规划（返回世界坐标路径列表）
         if map_grid is not None and pairs:
             try:
                 from algorithms.cbs_pathplan import cbs_plan_paths
-                # 调用 cbs，输入为 (start_obj, goal_world_pos) 二元组列表
                 plan_inputs = [(p[0], p[1]) for p in pairs]
                 world_paths = cbs_plan_paths(plan_inputs, map_grid=map_grid)
             except Exception:
                 world_paths = []
 
             if world_paths:
-                # 对于每个防守方，取路径的第二个点（第一点通常是起点）作为下一步航点
                 for defender, path in zip(defenders_order, world_paths):
                     if path and len(path) >= 2:
                         next_wp = path[1]
-                        # next_wp 是 [x,y,z]
                         chase_point(defender, next_wp)
-                        # 将整条路径缓存到 defender 上，供后续可能使用（非必需）
                         try:
                             defender._cbs_path = path
                             defender._cbs_goal = path[-1]
@@ -223,12 +432,10 @@ def update_chase_strategy(drones, offensive_target_point, assignment_cfg=None, m
                     elif path and len(path) == 1:
                         chase_point(defender, path[0])
                     else:
-                        # 路径为空，退化为直接追踪目标对象
                         target_obj = assignment.get(defender.name)
                         if target_obj is not None:
                             chase_target(defender, target_obj)
             else:
-                # CBS 未返回有效路径，退化为直接追踪
                 for def_name, target in assignment.items():
                     defender = name_to_defender.get(def_name)
                     if defender is None:
@@ -238,7 +445,6 @@ def update_chase_strategy(drones, offensive_target_point, assignment_cfg=None, m
                     else:
                         defender.set_velocity([0.0, 0.0, 0.0])
         else:
-            # 没有 map_grid，则保持原有行为：直接追踪
             for def_name, target in assignment.items():
                 defender = name_to_defender.get(def_name)
                 if defender is None:
@@ -247,51 +453,143 @@ def update_chase_strategy(drones, offensive_target_point, assignment_cfg=None, m
                     chase_target(defender, target)
                 else:
                     defender.set_velocity([0.0, 0.0, 0.0])
-    elif defensive:
-        # 没有进攻方时，防守方停止移动
-        for defender in defensive:
+    elif free_defenders:
+        for defender in free_defenders:
             defender.set_velocity([0.0, 0.0, 0.0])
+
+    # 向屏蔽方向派遣未分配的防守方
+    _dispatch_defenders_to_jammed_directions(
+        defensive=defensive,
+        jammers=jammers,
+        base_position=base_position,
+        map_grid=map_grid,
+    )
 
 
 #=================暂行无人机生成策略，之后要被任务分配算法替代============================================
 
-def spawn_random_drone(config: dict, drones: list) -> None:
+def spawn_random_drone(config: dict, drones: list, base_position: list = None) -> None:
+    """根据当前进攻方数量随机生成进攻方无人机。
+    - AttackDrone/TankDrone 在存在屏蔽扇区时偏向扇区方向生成
+    - 反辐射无人机以较低概率（约 15%）生成
+    """
+    if base_position is None:
+        base_position = [0.0, 0.0, 0.0]
+
     offensive = [d for d in drones if _is_offensive(d) and d.is_alive()]
     sim_cfg = config.get("simulation", {})
     max_offensive = int(sim_cfg.get("max_offensive", 6))
     if len(offensive) >= max_offensive:
         return
-    z = random.uniform(100.0, 250.0)
-    direction = random.choice(['top', 'bottom', 'left', 'right'])
-    if direction == 'top':
-        x = random.uniform(-500, 500)
-        y = random.uniform(520, 550)
-    elif direction == 'bottom':
-        x = random.uniform(-500, 500)
-        y = random.uniform(-550, -520)
-    elif direction == 'left':
-        x = random.uniform(-550, -520)
-        y = random.uniform(-500, 500)
-    else:  # right
-        x = random.uniform(520, 550)
-        y = random.uniform(-500, 500)
-    position = [x, y, z]
-    drone_type = random.choice(["attack", "tank"])
-    name = f"{drone_type.capitalize()}-{random.randint(100,999)}"
-    if drone_type == "attack":
-        create_attack_drone(name, position, config, drones)
-    elif drone_type == "tank":
-        create_tank_drone(name, position, config, drones)
+
+    jammers = _get_jammers(drones)
+    ard_prob = float(config.get("simulation", {}).get("anti_radiation_spawn_prob", 0.15))
+    ew_prob = float(config.get("simulation", {}).get("ew_spawn_prob", 0.10))
+    roll = random.random()
+
+    # 反辐射无人机
+    if roll < ard_prob:
+        z = random.uniform(100.0, 250.0)
+        direction = random.choice(['top', 'bottom', 'left', 'right'])
+        if direction == 'top':
+            x = random.uniform(-500, 500)
+            y = random.uniform(520, 550)
+        elif direction == 'bottom':
+            x = random.uniform(-500, 500)
+            y = random.uniform(-550, -520)
+        elif direction == 'left':
+            x = random.uniform(-550, -520)
+            y = random.uniform(-500, 500)
+        else:
+            x = random.uniform(520, 550)
+            y = random.uniform(-500, 500)
+        position = [x, y, z]
+        name = f"AntiRad-{random.randint(100, 999)}"
+        create_anti_radiation_drone(name, position, config, drones)
+        LOGGER.info("Spawned AntiRadiation drone: %s at %s", name, position)
+    elif roll < ard_prob + ew_prob:
+        # 电子战干扰无人机：从地图边界生成
+        z = random.uniform(100.0, 250.0)
+        direction = random.choice(['top', 'bottom', 'left', 'right'])
+        if direction == 'top':
+            x = random.uniform(-500, 500)
+            y = random.uniform(520, 550)
+        elif direction == 'bottom':
+            x = random.uniform(-500, 500)
+            y = random.uniform(-550, -520)
+        elif direction == 'left':
+            x = random.uniform(-550, -520)
+            y = random.uniform(-500, 500)
+        else:
+            x = random.uniform(520, 550)
+            y = random.uniform(-500, 500)
+        position = [x, y, z]
+        name = f"EW-{random.randint(100, 999)}"
+        create_ew_drone(name, position, config, drones)
+        LOGGER.info("Spawned EW drone: %s at %s", name, position)
+    else:
+        drone_type = random.choice(["attack", "tank"])
+        if jammers and random.random() < 0.65:
+            jammer = random.choice(jammers)
+            if jammer.jamming_direction is not None:
+                direction_angle = jammer.jamming_direction
+                half = jammer.jamming_sector_half_angle
+                angle = direction_angle + random.uniform(-half, half)
+                dist = random.uniform(250.0, 450.0)
+                z = random.uniform(100.0, 250.0)
+                x = base_position[0] + dist * math.cos(angle)
+                y = base_position[1] + dist * math.sin(angle)
+                position = [x, y, z]
+                name = f"{drone_type.capitalize()}-{random.randint(100, 999)}"
+                if drone_type == "attack":
+                    create_attack_drone(name, position, config, drones)
+                elif drone_type == "tank":
+                    create_tank_drone(name, position, config, drones)
+                return
+
+        z = random.uniform(100.0, 250.0)
+        direction = random.choice(['top', 'bottom', 'left', 'right'])
+        if direction == 'top':
+            x = random.uniform(-500, 500)
+            y = random.uniform(520, 550)
+        elif direction == 'bottom':
+            x = random.uniform(-500, 500)
+            y = random.uniform(-550, -520)
+        elif direction == 'left':
+            x = random.uniform(-550, -520)
+            y = random.uniform(-500, 500)
+        else:
+            x = random.uniform(520, 550)
+            y = random.uniform(-500, 500)
+        position = [x, y, z]
+        name = f"{drone_type.capitalize()}-{random.randint(100, 999)}"
+        if drone_type == "attack":
+            create_attack_drone(name, position, config, drones)
+        elif drone_type == "tank":
+            create_tank_drone(name, position, config, drones)
 
 def balance_defenders(config: dict, drones: list) -> None:
-    """立即平衡防守方数量，直到防守方数量 >= 进攻方数量"""
+    """基于未匹配攻击方数量补充防守方。
+
+    只统计可用防守方（未被 EW 干扰、非 AntiEW），与可见进攻方数量对比。
+    """
     offensive = [d for d in drones if _is_offensive(d) and d.is_alive()]
-    defensive = [d for d in drones if not _is_offensive(d) and d.is_alive()]
-    # 计算需要补充的防守方数量
-    need = max(0, len(offensive) - len(defensive))
+    # 可用防守方：存活、未被干扰(或被干扰但属于拦截机)、非 AntiEW（AntiEW 不参与常规分配）
+    from drones.defensive.anti_ew_drone import AntiEWDrone
+    from drones.defensive.interceptor_drone import InterceptorDrone
+
+    available_defenders = [
+        d for d in drones
+        if not _is_offensive(d)
+        and d.is_alive()
+        and not isinstance(d, AntiEWDrone)
+        and (not getattr(d, '_ew_jammed', False) or isinstance(d, InterceptorDrone))
+    ]
+    # 需要匹配的攻击方数量 = 可见进攻方（排除 ARD，它在自我毁灭路径上）
+    target_count = len([a for a in offensive if not isinstance(a, AntiRadiationDrone)])
+    need = max(0, target_count - len(available_defenders))
     if need <= 0:
-        return  #如果防守方数量大于进攻方，则直接返回
-    # 一次性生成 need 架防守方（固定在基地）
+        return
     for _ in range(need):
         drone_type = random.choice(["scout", "interceptor"])
         position = [0.0, 0.0, 0.0]
@@ -368,6 +666,9 @@ def run_simulation(config: dict):
     spawn_max = config.get("simulation", {}).get("spawn_interval_max", 3.0)
     next_spawn_time = random.uniform(spawn_min, spawn_max)
     spawn_timer = 0.0
+    # 反辐射无人机自毁检查间隔（每 0.5 秒集中检查一次）
+    ard_check_interval = 0.5
+    ard_check_timer = 0.0
     base_position = config["base"]["position"]   # 例如 [0, 0, 0]
 
     #将帧率fps的值设置为配置中simulation-fps的值
@@ -406,9 +707,30 @@ def run_simulation(config: dict):
             #5.获取存活无人机列表
             alive_drones = [d for d in drones if not d.destroyed]
 
+            #5.5 反辐射无人机自毁检查（每 0.5 秒集中检查一次）
+            ard_check_timer += frame_time
+            if ard_check_timer >= ard_check_interval:
+                ard_check_timer = 0.0
+                for drone in alive_drones:
+                    if isinstance(drone, AntiRadiationDrone) and drone.is_alive():
+                        if drone.check_self_destruct(base_position):
+                            LOGGER.info(
+                                "AntiRadiation drone %s self-destructed near base at %s",
+                                drone.name, drone.position,
+                            )
+
             #6. 更新存活无人机的追逐策略
             # 将 display.map_grid 传入路径规划模块；若 display 不存在则传入 None
-            update_chase_strategy(alive_drones, base_position, _ASSIGNMENT_CONFIG, map_grid=(display.map_grid if display is not None else None)) #进攻方的目标点暂时设定为基地位置
+            update_chase_strategy(
+                alive_drones,
+                base_position,
+                _ASSIGNMENT_CONFIG,
+                map_grid=(display.map_grid if display is not None else None),
+                base_position=base_position,
+            ) #进攻方的目标点暂时设定为基地位置
+
+            #6.5 检测 EW 无人机，生成 AntiEW 应对
+            _spawn_anti_ew_if_needed(config, alive_drones, base_position)
             # 更新每架无人机的追逐策略 """
 
             #7. 更新存活无人机的位置
@@ -427,7 +749,7 @@ def run_simulation(config: dict):
                 spawn_timer = 0.0
                 next_spawn_time = random.uniform(spawn_min, spawn_max)
                 if random.random() < 0.9:
-                    spawn_random_drone(config, drones)
+                    spawn_random_drone(config, drones, base_position)
 
             #10. 平衡防守方数量
             balance_defenders(config, drones) #每帧立即平衡防守方数量, 直到防守方数量 >= 进攻方数量"""

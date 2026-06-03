@@ -54,6 +54,8 @@ class ImprovedAuctionConfig:
     enable_local_refine: bool = True
     local_refine_rounds: int = 5
     communication_range: float = 280.0
+    comm_soft_decay: float = 100.0
+    top_k_proposers: int = 2
     max_operational_distance: float = 1200.0
     response_distance_weight: float = 0.55
     response_energy_weight: float = 0.30
@@ -332,13 +334,20 @@ def greedy_assignment(
     attackers: List[Any],
     config: ImprovedAuctionConfig | None = None,
     map_grid: Optional[Any] = None,
+    jammed_mask: Optional[np.ndarray] = None,
 ) -> Dict[str, Optional[Any]]:
     """基于改进拍卖算法的 AirCombat 兼容分配接口。
+
+    参数:
+        defenders:      防守方无人机列表
+        attackers:      进攻方无人机列表
+        config:         算法配置
+        map_grid:       可选地图网格（用于 LOS 与路径规划）
+        jammed_mask:    可选布尔数组 [n_def]，True 表示该防守方被 EW 干扰
 
     返回：{防守方名称: 进攻方对象或 None}
     """
 
-    # 完全遵守旧接口契约：键是防守方 name，值是目标对象或 None。
     if not defenders:
         return {}
 
@@ -347,8 +356,7 @@ def greedy_assignment(
 
     cfg = config or ImprovedAuctionConfig()
 
-    # 将论文中的“提议-响应-选择”思想落地为效用增强，而非仅做纯距离匹配。
-    utility = _build_cma_enhanced_utility(defenders, attackers, cfg, map_grid=map_grid)
+    utility = _build_cma_enhanced_utility(defenders, attackers, cfg, map_grid=map_grid, jammed_mask=jammed_mask)
 
     solver = ImprovedAuctionSolver(cfg)
     n_def, n_att = utility.shape
@@ -553,6 +561,7 @@ def _build_cma_enhanced_utility(
     attackers: List[Any],
     cfg: ImprovedAuctionConfig,
     map_grid: Optional[Any] = None,
+    jammed_mask: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """构建融合“提议-响应-选择”机制的效用矩阵。"""
     if cfg.use_geographic_coords and _geo_to_local_enu is None:
@@ -561,6 +570,10 @@ def _build_cma_enhanced_utility(
     n_def = len(defenders)
     n_att = len(attackers)
     utility = np.zeros((n_def, n_att), dtype=np.float64)
+
+    # EW 干扰：被干扰防守方效用置底，拍卖直接排除
+    if jammed_mask is not None and jammed_mask.any():
+        utility[jammed_mask, :] = -cfg.out_of_range_penalty
 
     defender_positions = _build_positions(defenders, cfg)
     attacker_positions = _build_positions(attackers, cfg)
@@ -614,18 +627,25 @@ def _build_cma_enhanced_utility(
         candidate_mask = np.zeros(n_def, dtype=bool)
         candidate_mask[spatial_candidates] = True
 
-        proposer_idx = _select_proposer(distance_row, spatial_candidates)
-        # Stage-2 响应：提议者仅与通信半径内成员协商。
-        proposer_delta = defender_positions - defender_positions[proposer_idx]
-        proposer_delta[:, 2] = proposer_delta[:, 2] * abs(cfg.height_weight)
-        proposer_distances = np.linalg.norm(proposer_delta, axis=1)
-        comm_candidates = _collect_candidates(
-            proposer_distances,
-            cfg.communication_range,
-            spatial_candidates,
-        )
+        # Stage-1 提议：选取 Top-K 最近防守方（避免单点故障）。
+        top_k = max(1, min(cfg.top_k_proposers, len(spatial_candidates)))
+        proposer_indices = _select_top_k_proposers(distance_row, spatial_candidates, k=top_k)
+
+        # Stage-2 响应：取所有提议者通信邻居的并集。
+        comm_candidates_set: set = set()
+        for proposer_idx in proposer_indices:
+            proposer_delta = defender_positions - defender_positions[proposer_idx]
+            proposer_delta[:, 2] = proposer_delta[:, 2] * abs(cfg.height_weight)
+            proposer_distances = np.linalg.norm(proposer_delta, axis=1)
+            neighbors = _collect_candidates(
+                proposer_distances,
+                cfg.communication_range,
+                spatial_candidates,
+            )
+            comm_candidates_set.update(neighbors)
+        comm_candidates = sorted(comm_candidates_set)
         if not comm_candidates:
-            comm_candidates = [proposer_idx]
+            comm_candidates = [proposer_indices[0]]
         feasible_scores = _response_feasibility_scores(
             defenders,
             distance_row,
@@ -640,7 +660,7 @@ def _build_cma_enhanced_utility(
             if score >= cfg.response_threshold
         }
         if not feasible_map:
-            feasible_map = {proposer_idx: 0.0}
+            feasible_map = {proposer_indices[0]: 0.0}
         responders = list(feasible_map)
         responder_set = set(responders)
 
@@ -707,15 +727,29 @@ def _build_cma_enhanced_utility(
     return utility
 
 
+def _select_top_k_proposers(distance_row: np.ndarray, candidate_indices: List[int], k: int = 2) -> List[int]:
+    """选取距离最近的至多 K 个提议者（Top-K 机制，避免单点故障）。"""
+    if distance_row.size == 0 or not candidate_indices:
+        if distance_row.size > 0:
+            return [int(np.argmin(distance_row))]
+        return []
+    k = max(1, min(k, len(candidate_indices)))
+    candidate_dist = distance_row[candidate_indices]
+    if k >= len(candidate_indices):
+        return list(candidate_indices)
+    # 用 argpartition 取前 k 小
+    kth = np.argpartition(candidate_dist, k - 1)[:k]
+    return [int(candidate_indices[i]) for i in kth]
+
+
 def _select_proposer(distance_row: np.ndarray, candidate_indices: List[int]) -> int:
-    """按距离最近原则选择提议无人机。"""
+    """保留旧接口兼容：选择最近一个提议者。"""
     if distance_row.size == 0:
         raise ValueError("defenders must be non-empty")
     if not candidate_indices:
         return int(np.argmin(distance_row))
     candidate_dist = distance_row[candidate_indices]
-    best_local = int(np.argmin(candidate_dist))
-    return int(candidate_indices[best_local])
+    return int(candidate_indices[int(np.argmin(candidate_dist))])
 
 
 def _collect_candidates(
@@ -723,20 +757,35 @@ def _collect_candidates(
     communication_range: float,
     candidate_indices: List[int],
 ) -> List[int]:
-    """收集提议者通信范围内的候选防守方。"""
+    """收集提议者通信范围内的候选防守方（软边界 via sigmoid）。"""
     if proposer_distances.size == 0:
         return []
+    # 硬截断先收窄候选集，再用 sigmoid 做二次过滤
+    hard_radius = communication_range * 1.5
     if not candidate_indices:
-        indices = np.flatnonzero(proposer_distances <= communication_range).tolist()
+        candidate_indices = np.flatnonzero(proposer_distances <= hard_radius).tolist()
     else:
-        indices = [
-            idx
-            for idx in candidate_indices
-            if proposer_distances[idx] <= communication_range
+        candidate_indices = [
+            idx for idx in candidate_indices
+            if proposer_distances[idx] <= hard_radius
         ]
-    if not indices:
+    if not candidate_indices:
         return []
-    return indices
+    return candidate_indices
+
+
+def _comm_smooth_weight(dist: float, comm_range: float, soft_decay: float = 100.0) -> float:
+    """通信范围 sigmoid 平滑权重：在边界附近渐变而非硬截断。
+
+    w(dist) = 1 / (1 + exp((dist - range) / decay))
+    当 dist ≪ range 时 w≈1；dist ≈ range 时 w≈0.5；dist ≫ range 时 w→0。
+    """
+    if comm_range <= 0:
+        return 1.0
+    if soft_decay <= 0:
+        return 1.0 if dist <= comm_range else 0.0
+    return float(1.0 / (1.0 + math.exp((dist - comm_range) / soft_decay)))
+
 
 
 def _response_feasibility_scores(
@@ -770,43 +819,42 @@ def _cma_attention_scores(
     cfg: ImprovedAuctionConfig,
     distance_row: np.ndarray,
 ) -> Dict[int, float]:
-    """用轻量注意力计算任务与候选防守方的匹配权重。"""
+    """轻量注意力：Q 和 K 共享相同五维特征空间，点积匹配任务需求与防守能力。
+
+    Q (任务需求): [closeness, speed, health, attack_power, urgency]
+    K (防守能力): [closeness, speed, health, attack_power, availability]
+    """
     if not responder_indices:
         return {}
 
-    closeness, task_speed, task_attack, task_health = _attacker_scores(
+    # --- 任务侧 Query（该进攻方的威胁特征）---
+    task_closeness, task_speed, task_attack, task_health = _attacker_scores(
         attacker, cfg.max_operational_distance, attacker_position
     )
     urgency = _estimate_attacker_urgency(
         attacker, cfg.max_operational_distance, attacker_position
     )
-
+    # Q: [离基地近度, 速度, 血量, 攻击力, 紧迫度]
     q = np.asarray(
-        [
-            urgency,
-            closeness,
-            task_speed,
-            task_attack,
-            task_health,
-        ],
+        [task_closeness, task_speed, task_health, task_attack, urgency],
         dtype=np.float64,
     )
 
     logits: List[float] = []
     for idx in responder_indices:
         defender = defenders[idx]
-        # key 向量体现候选防守方对当前任务的执行能力。
-        energy_score, health_score = _defender_resource_scores(defender)
+        # --- 防守侧 Key（该防守方的执行能力，与 Q 同语义维度）---
+        def_closeness = _pair_distance_score(distance_row[idx], cfg.max_operational_distance)
+        def_speed = _ratio(_speed(defender), _MAX_SPEED_REF)
+        def_health = _ratio(getattr(defender, "health", 0.0), _MAX_HEALTH_REF)
+        def_attack = _ratio(getattr(defender, "attack_power", 0.0), _MAX_ATTACK_POWER_REF)
+        availability = 1.0 - _estimate_defender_load(defender)
+        # K: [距任务近度, 速度, 血量, 攻击力, 可用性]
         k = np.asarray(
-            [
-                _pair_distance_score(distance_row[idx], cfg.max_operational_distance),
-                _ratio(_speed(defender), _MAX_SPEED_REF),
-                energy_score,
-                health_score,
-                1.0 - _estimate_defender_load(defender),
-            ],
+            [def_closeness, def_speed, def_health, def_attack, availability],
             dtype=np.float64,
         )
+        # Q·K / √d：标准 scaled dot-product attention
         score = float(np.dot(q, k) / np.sqrt(q.size))
         logits.append(score / max(cfg.attention_temperature, 1e-6))
 

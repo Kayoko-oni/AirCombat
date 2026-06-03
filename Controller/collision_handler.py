@@ -3,6 +3,14 @@ from typing import List, Tuple
 from drones.base_drone import BaseDrone
 from utils.geometry import distance
 
+# 进攻方类型集合（供多处使用）
+_OFFENSIVE_TYPES = {"AttackDrone", "TankDrone", "AntiRadiationDrone", "EWDrone"}
+
+def is_offensive_type(drone_type: str) -> bool:
+    """判断是否为进攻方类型。"""
+    return drone_type in _OFFENSIVE_TYPES
+
+
 def detect_collisions(drones: List[BaseDrone], min_distance: float = 8.0) -> List[Tuple[BaseDrone, BaseDrone]]:
     """
     无人机碰撞检测
@@ -18,11 +26,9 @@ def detect_collisions(drones: List[BaseDrone], min_distance: float = 8.0) -> Lis
             if not drones[i].is_alive() or not drones[j].is_alive():
                 continue
             
-            # 新增：判断是否同一阵营
-            # 进攻方: AttackDrone 或 TankDrone
-            # 防守方: ScoutDrone 或 InterceptorDrone
-            is_offensive_i = drones[i].drone_type in {"AttackDrone", "TankDrone"}
-            is_offensive_j = drones[j].drone_type in {"AttackDrone", "TankDrone"}
+            # 判断是否同一阵营
+            is_offensive_i = is_offensive_type(drones[i].drone_type)
+            is_offensive_j = is_offensive_type(drones[j].drone_type)
             if is_offensive_i == is_offensive_j:
                 continue  # 同一阵营，跳过碰撞检测
             

@@ -39,13 +39,52 @@ class Open3DDisplay:
         self.scene_widget.scene = self.rendering.Open3DScene(self.window.renderer)
         self.window.add_child(self.scene_widget)
 
-        # Status label as HUD overlay
-        self.status_label = self.gui.Label("")
-        self.status_label.text_color = self.gui.Color(1.0, 1.0, 1.0, 1.0)
-        self.status_label.background_color = self.gui.Color(0.0, 0.0, 0.0, 0.5)  # Semi-transparent background
-        self.window.add_child(self.status_label)
-        # Position the label at top-left
-        self.status_label.frame = self.gui.Rect(10, 10, 350, 100)
+        # ── 美化 HUD：多标签堆叠面板（纯 ASCII，无 Unicode 方框）──
+        # 颜色常量
+        self._hud_bg   = self.gui.Color(0.03, 0.03, 0.08, 0.80)  # 深色面板背景
+        self._hud_white   = self.gui.Color(0.95, 0.95, 0.97, 1.0)  # 主文字
+        self._hud_dim     = self.gui.Color(0.50, 0.50, 0.55, 1.0)  # 弱化文字
+        self._hud_green   = self.gui.Color(0.15, 0.90, 0.25, 1.0)  # 血量高
+        self._hud_orange  = self.gui.Color(1.00, 0.65, 0.10, 1.0)  # 血量中 / EW 警告
+        self._hud_red     = self.gui.Color(0.95, 0.20, 0.20, 1.0)  # 血量低 / 危险
+        self._hud_purple  = self.gui.Color(0.65, 0.20, 0.85, 1.0)  # Attack
+        self._hud_yellow  = self.gui.Color(1.00, 0.85, 0.10, 1.0)  # Tank
+        self._hud_blue    = self.gui.Color(0.15, 0.60, 1.00, 1.0)  # EW
+        self._hud_darkred = self.gui.Color(0.90, 0.10, 0.25, 1.0)  # ARD
+        self._hud_emerald = self.gui.Color(0.15, 0.80, 0.20, 1.0)  # Scout
+        self._hud_cyan    = self.gui.Color(0.15, 0.80, 0.95, 1.0)  # Interceptor
+        self._hud_brown   = self.gui.Color(1.00, 0.40, 0.10, 1.0)  # AntiEW
+
+        # HUD 布局常量
+        self._hud_x = 16
+        self._hud_y0 = 12
+        self._hud_w = 440
+        self._hud_row_h = 22
+        self._hud_gap = 10
+
+        # 所有 HUD 标签行
+        self._hud_labels = {}
+        self._hud_rows = {
+            "title":    0,
+            "offense":  2,
+            "defense":  3,
+            "status":   5,
+            "hp":       7,
+            "legend_off": 9,
+            "legend_def": 10,
+            "controls": 12,
+        }
+        for key in self._hud_rows:
+            lbl = self.gui.Label("")
+            lbl.background_color = self._hud_bg
+            self.window.add_child(lbl)
+            self._hud_labels[key] = lbl
+
+        # FPS 追踪
+        self._fps_frame_count = 0
+        self._fps_accum_time = 0.0
+        self._fps_current = 0.0
+        self._sim_elapsed = 0.0
 
         # Set scene widget to fill the window
         self.scene_widget.frame = self.gui.Rect(0, 0, self.window.content_rect.width, self.window.content_rect.height)
@@ -64,6 +103,26 @@ class Open3DDisplay:
         self.map_data_initialized = False   # 地图数据是否已生成
         self.buildings = None               # 建筑列表
         self.map_grid = None                # 障碍物网格对象
+
+        self.offensive_types = {"AttackDrone", "TankDrone", "AntiRadiationDrone", "EWDrone"}
+        self.drone_color_map = {
+            "AttackDrone": (0.65, 0.2, 0.85),
+            "TankDrone": (1.0, 0.85, 0.1),
+            "AntiRadiationDrone": (0.9, 0.15, 0.3),
+            "EWDrone": (0.1, 0.6, 1.0),
+            "ScoutDrone": (0.2, 0.8, 0.2),
+            "InterceptorDrone": (0.2, 0.8, 0.95),
+            "AntiEWDrone": (1.0, 0.4, 0.1),
+        }
+        self.drone_color_names = {
+            "AttackDrone": "purple",
+            "TankDrone": "yellow",
+            "AntiRadiationDrone": "deep-red",
+            "EWDrone": "blue",
+            "ScoutDrone": "green",
+            "InterceptorDrone": "cyan",
+            "AntiEWDrone": "orange",
+        }
 
         # Set up camera
         bounds = self.o3d.geometry.AxisAlignedBoundingBox(
@@ -85,8 +144,31 @@ class Open3DDisplay:
             return self.gui.SceneWidget.EventCallbackResult.CONSUMED
         return self.gui.SceneWidget.EventCallbackResult.IGNORED
 
+    def _key_callback(self, event):
+        """键盘快捷键：R=重置视角 P=暂停 T=切换路径显示"""
+        if event.type == self.gui.KeyEvent.Type.DOWN:
+            key = event.key
+            if key == ord('R') or key == ord('r'):
+                bounds = self.o3d.geometry.AxisAlignedBoundingBox(
+                    np.array([-1000, -1000, -100], dtype=np.float64),
+                    np.array([1000, 1000, 100], dtype=np.float64),
+                )
+                center = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+                self.scene_widget.setup_camera(45.0, bounds, center)
+                return self.gui.SceneWidget.EventCallbackResult.CONSUMED
+            elif key == ord('P') or key == ord('p'):
+                self.paused = not self.paused
+                print(f"[HUD] Paused: {self.paused}")
+                return self.gui.SceneWidget.EventCallbackResult.CONSUMED
+            elif key == ord('T') or key == ord('t'):
+                self.show_paths = not self.show_paths
+                print(f"[HUD] Show paths: {self.show_paths}")
+                return self.gui.SceneWidget.EventCallbackResult.CONSUMED
+        return self.gui.SceneWidget.EventCallbackResult.IGNORED
+
     def open_window(self):
         self.scene_widget.set_on_mouse(self._mouse_callback)
+        self.scene_widget.set_on_key(self._key_callback)
         self.window.set_on_layout(self._on_layout)
         self.window.show(True)
 
@@ -171,10 +253,11 @@ class Open3DDisplay:
         self.scene_widget.frame = self.gui.Rect(0, 0, r.width, r.height)
         return self.gui.Widget.EventCallbackResult.HANDLED
 
+    def _color_for_type(self, drone_type: str):
+        return self.drone_color_map.get(drone_type, (0.7, 0.7, 0.7))
+
     def _drone_color(self, drone: BaseDrone):
-        if drone.drone_type in {"AttackDrone", "TankDrone"}:
-            return (1.0, 0.2, 0.2)
-        return (0.2, 0.4, 1.0)
+        return self._color_for_type(drone.drone_type)
 
     def _label_text(self, drone: BaseDrone, nearest_dist: float):
         return f"{drone.name} ({drone.drone_type})\nD={nearest_dist:.1f}"
@@ -189,24 +272,92 @@ class Open3DDisplay:
                 best = dist
         return best if best != float("inf") else 0.0
 
-    def _status_text(self, drones: List[BaseDrone], base_health: float) -> str:
+    # ── 美化版 HUD：多标签行，纯 ASCII ──
+
+    @staticmethod
+    def _bar_ascii(pct: float, width: int = 16) -> str:
+        """ASCII 进度条：使用 # 和 - 字符，例如 [############----]"""
+        pct = max(0.0, min(100.0, pct))
+        filled = max(0, min(width, int(round(pct / 100.0 * width))))
+        return "[" + "#" * filled + "-" * (width - filled) + "]"
+
+    def _refresh_hud(self, drones: list, base_health: float) -> None:
+        """每帧刷新所有 HUD 行标签的文本与颜色。"""
         active = [d for d in drones if not d.destroyed]
-        red = [d for d in active if d.drone_type in {"AttackDrone", "TankDrone"}]
-        blue = [d for d in active if d.drone_type not in {"AttackDrone", "TankDrone"}]
-        type_counts = {
-            "AttackDrone": sum(1 for d in active if d.drone_type == "AttackDrone"),
-            "TankDrone": sum(1 for d in active if d.drone_type == "TankDrone"),
-            "ScoutDrone": sum(1 for d in active if d.drone_type == "ScoutDrone"),
-            "InterceptorDrone": sum(1 for d in active if d.drone_type == "InterceptorDrone"),
-        }
-        status_lines = [
-            f"Red Team: {len(red)}  Blue Team: {len(blue)}",
-            f"Attack: {type_counts['AttackDrone']}  Tank: {type_counts['TankDrone']}",
-            f"Scout: {type_counts['ScoutDrone']}  Interceptor: {type_counts['InterceptorDrone']}",
-            f"Base Health: {base_health:.1f}",
-            "Right-click reset view",
-        ]
-        return "\n".join(status_lines)
+        tc = {t: sum(1 for d in active if d.drone_type == t) for t in self.drone_color_map}
+
+        # EW 状态
+        ew_active = any(getattr(d, "jamming_active", False) for d in drones
+                        if d.drone_type == "EWDrone" and d.is_alive())
+        jammed_count = sum(1 for d in drones
+                           if d.drone_type not in self.offensive_types
+                           and getattr(d, "_ew_jammed", False) and d.is_alive())
+
+        # FPS + 时间
+        fps_str = f"{self._fps_current:5.1f}"
+        mins = int(self._sim_elapsed // 60)
+        secs = int(self._sim_elapsed % 60)
+        time_str = f"{mins:02d}:{secs:02d}"
+
+        # ── 设置每行文字与颜色 ──
+        labels = self._hud_labels
+
+        # 标题行
+        labels["title"].text = "===  AIR  COMBAT  SIMULATION  ==="
+        labels["title"].text_color = self._hud_white
+
+        # 进攻方行
+        off_parts = f"Attack: {tc['AttackDrone']}    Tank: {tc['TankDrone']}    ARD: {tc['AntiRadiationDrone']}    EW: {tc['EWDrone']}"
+        labels["offense"].text = off_parts
+        labels["offense"].text_color = self._hud_orange
+
+        # 防守方行
+        def_parts = f"Scout: {tc['ScoutDrone']}    Inter: {tc['InterceptorDrone']}    AEW: {tc['AntiEWDrone']}"
+        labels["defense"].text = def_parts
+        labels["defense"].text_color = self._hud_cyan
+
+        # 状态行
+        ew_text = "ACTIVE" if ew_active else "none"
+        jam_text = str(jammed_count) if jammed_count > 0 else "none"
+        status_text = f"Offense: {sum(tc[t] for t in ['AttackDrone','TankDrone','AntiRadiationDrone','EWDrone'])}    Defense: {sum(tc[t] for t in ['ScoutDrone','InterceptorDrone','AntiEWDrone'])}    EW: {ew_text}    Jammed: {jam_text}"
+        labels["status"].text = status_text
+        labels["status"].text_color = self._hud_dim
+
+        # 血量条行
+        bar = self._bar_ascii(base_health)
+        hp_text = f"Base HP  {bar}  {base_health:5.1f}%"
+        labels["hp"].text = hp_text
+        if base_health > 60:
+            labels["hp"].text_color = self._hud_green
+        elif base_health > 30:
+            labels["hp"].text_color = self._hud_orange
+        else:
+            labels["hp"].text_color = self._hud_red
+
+        # 图例行 - 进攻方
+        labels["legend_off"].text = "* Attack = purple    Tank = yellow    ARD = red    EW = blue"
+        labels["legend_off"].text_color = self._hud_dim
+
+        # 图例行 - 防守方
+        labels["legend_def"].text = "+ Scout = green    Inter = cyan    AEW = orange"
+        labels["legend_def"].text_color = self._hud_dim
+
+        # 控制行
+        ctrl_text = f"FPS: {fps_str}    Time: {time_str}    [R] Reset    [P] Pause    [T] Paths"
+        labels["controls"].text = ctrl_text
+        labels["controls"].text_color = self._hud_dim
+
+        # ── 更新每行的 frame 位置 ──
+        row_h = self._hud_row_h
+        w = self._hud_w
+        x = self._hud_x
+        for key, row_idx in self._hud_rows.items():
+            y = self._hud_y0 + row_idx * (row_h + self._hud_gap)
+            self._hud_labels[key].frame = self.gui.Rect(x, y, w, row_h)
+
+    # 保留旧名兼容
+    def _status_text(self, drones, base_health):
+        return " "  # 不再使用单一大标签
 
     def _safe_add_dynamic_geometry(self, name: str, geometry, material) -> bool:
         """Add dynamic geometry defensively to avoid GUI crashes from invalid shapes."""
@@ -237,13 +388,13 @@ class Open3DDisplay:
                 pass
         self.dynamic_geometries.clear()
 
-        offensive = [d for d in drones if d.drone_type in {"AttackDrone", "TankDrone"} and not d.destroyed]
-        defensive = [d for d in drones if d.drone_type not in {"AttackDrone", "TankDrone"} and not d.destroyed]
+        offensive = [d for d in drones if d.drone_type in self.offensive_types and not d.destroyed]
+        defensive = [d for d in drones if d.drone_type not in self.offensive_types and not d.destroyed]
 
         for drone in drones:
             if drone.destroyed:
                 if drone.impact:
-                    explosion_color = (0.8, 0.2, 0.0) if drone.drone_type in {"AttackDrone", "TankDrone"} else (0.0, 0.2, 0.8)
+                    explosion_color = self._color_for_type(drone.drone_type)
                     debris = create_explosion_mesh(drone.position, drone.death_timer, drone.death_effect_duration, color=explosion_color)
                     material = self.rendering.MaterialRecord()
                     material.base_color = explosion_color + (1.0,)
@@ -254,7 +405,7 @@ class Open3DDisplay:
                         fall_color = (0.8, 0.8, 0.8)
                         mesh = create_drone_model_mesh(drone.position, color=fall_color)
                     else:
-                        fall_color = (0.6, 0.1, 0.1) if drone.drone_type in {"AttackDrone", "TankDrone"} else (0.1, 0.1, 0.6)
+                        fall_color = self._color_for_type(drone.drone_type)
                         mesh = create_drone_mesh(drone.position, color=fall_color)
 
                     material = self.rendering.MaterialRecord()
@@ -277,7 +428,7 @@ class Open3DDisplay:
             self._safe_add_dynamic_geometry(f"drone_{drone.name}", mesh, material)
 
             if len(drone.trail) > 1:
-                trail_color = (1.0, 0.2, 0.2) if drone.drone_type in {"AttackDrone", "TankDrone"} else (0.2, 0.4, 1.0)
+                trail_color = self._color_for_type(drone.drone_type)
                 path = create_path_line(drone.trail, color=trail_color)
                 if path is not None:
                     material_trail = self.rendering.MaterialRecord()
@@ -321,8 +472,27 @@ class Open3DDisplay:
             enemies = defensive if drone in offensive else offensive
             nearest_dist = self._nearest_enemy_distance(drone, enemies)
 
-        status_text = self._status_text(drones, base_health)
-        self.status_label.text = status_text
+        # ── FPS 跟踪 ──
+        import time as _time
+        now = _time.perf_counter()
+        if not hasattr(self, '_last_fps_tick'):
+            self._last_fps_tick = now
+        dt = now - self._last_fps_tick
+        self._last_fps_tick = now
+        if dt > 0:
+            self._fps_accum_time += dt
+            self._fps_frame_count += 1
+            if self._fps_accum_time >= 0.5:
+                self._fps_current = self._fps_frame_count / self._fps_accum_time
+                self._fps_frame_count = 0
+                self._fps_accum_time = 0.0
+
+        # ── HUD 更新 ──
+        if self._fps_current > 0:
+            self._sim_elapsed += 1.0 / self._fps_current
+        else:
+            self._sim_elapsed += 0.016  # ~60fps fallback
+        self._refresh_hud(drones, base_health)
 
         self.scene_widget.force_redraw()
         self.window.post_redraw()
