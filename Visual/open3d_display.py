@@ -192,29 +192,34 @@ class Open3DDisplay:
         material.base_color = (0.92, 0.92, 0.92, 0.95)
         self.scene_widget.scene.add_geometry("ground_plane", ground, material)
 
-    def _add_static_objects(self, base_position):  #只在首次更新时添加静态物体（坐标轴、地面、基地模型、建筑）
+    def _add_static_objects(self, base_positions):  # 只在首次更新时添加静态物体（坐标轴、地面、基地模型、建筑）
         # 坐标轴
         coord_frame = self.o3d.geometry.TriangleMesh.create_coordinate_frame(size=60.0)
         coord_frame.compute_vertex_normals()
         self.scene_widget.scene.add_geometry("coord_frame", coord_frame, self.rendering.MaterialRecord())
         # 地面
         self._add_ground_plane()
-        # 基地模型
-        self._add_base_model(base_position)
+        # 基地模型（支持多个基地）
+        if isinstance(base_positions, list) and base_positions:
+            for i, bp in enumerate(base_positions):
+                self._add_base_model(i, bp)
+        else:
+            # 兼容旧的 single-base 情形
+            self._add_base_model(0, base_positions or [0.0, 0.0, 0.0])
         #添加建筑物
         self._add_buildings()
 
         self.static_objects_added = True
 
-    def _add_base_model(self, base_position):
-        """在原点添加基地模型（灰色长方体+绿色球体）"""
-        # 使用我们之前定义的 create_guts_base_mesh 函数
+    def _add_base_model(self, idx: int, base_position):
+        """根据索引为指定基地添加模型，名称为 base_model_{idx}。"""
         from Visual.render_utils import create_guts_base_mesh
 
         base_mesh = create_guts_base_mesh(base_position)
         material = self.rendering.MaterialRecord()
         material.shader = 'defaultLit'
-        self.scene_widget.scene.add_geometry("base_model", base_mesh, material)
+        name = f"base_model_{idx}"
+        self.scene_widget.scene.add_geometry(name, base_mesh, material)
         
 
     def _add_buildings(self):
@@ -378,14 +383,14 @@ class Open3DDisplay:
             print(f"[WARN] Skip geometry {name}: {exc}")
             return False
 
-    def update(self, drones: List[BaseDrone], detections, base_health: float, base_position):
+    def update(self, drones: List[BaseDrone], detections, base_health: float, base_positions):
         if not self.is_open:
             return
 
         if not self.map_initialized:
             self._init_map_data()
         if not self.static_objects_added:
-            self._add_static_objects(base_position)
+            self._add_static_objects(base_positions)
 
         # 清理每帧重建的动态几何体（轨迹、虚线等）
         for name in list(self.dynamic_geometries):

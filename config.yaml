@@ -15,6 +15,21 @@ base:
   position: [-10, -25, 0]
   collision_radius: 12.5
 
+# 新增多基地配置（向后兼容：若存在 bases 则使用 bases，否则使用 base 下的单基地配置）
+bases:
+  - name: Base-Alpha
+    position: [-10, -25, 0]
+    health: 100
+    collision_radius: 15
+  - name: Base-Bravo
+    position: [270, -200, 0]
+    health: 100
+    collision_radius: 15
+  - name: Base-Charlie
+    position: [-290, 180, 0]
+    health: 100
+    collision_radius: 15
+
 simulation:
   fps: 30
   duration: 300

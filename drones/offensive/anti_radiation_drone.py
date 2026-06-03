@@ -60,6 +60,8 @@ class AntiRadiationDrone(BaseDrone):
         dx = self.position[0] - base_position[0]
         dy = self.position[1] - base_position[1]
         self.jamming_direction = math.atan2(dy, dx)
+        # 保存该 ARD 绑定的基地位置，供多基地逻辑使用
+        self._base_position = base_position
         self._jamming_direction_initialized = True
 
     @property
@@ -70,7 +72,7 @@ class AntiRadiationDrone(BaseDrone):
     def is_in_jammed_sector(
         self,
         point: List[float],
-        base_position: List[float],
+        base_position: List[float] | None = None,
     ) -> bool:
         """判断 point 是否处于本机屏蔽扇区内。
 
@@ -82,6 +84,11 @@ class AntiRadiationDrone(BaseDrone):
         if not self.jamming_active or self.jamming_direction is None:
             return False
 
+        # 若未传入基地位置，尝试使用初始化时保存的基地位置
+        if base_position is None:
+            base_position = getattr(self, "_base_position", None)
+        if base_position is None:
+            return False
         dx = point[0] - base_position[0]
         dy = point[1] - base_position[1]
         if abs(dx) < 1e-6 and abs(dy) < 1e-6:

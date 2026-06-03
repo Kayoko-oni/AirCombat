@@ -19,6 +19,22 @@ try:
 except Exception:
     _geo_to_local_enu = None
 
+# 可选的全局基地位置列表（由仿真主循环设置），用于将攻击方距离归一化到最近基地
+_BASE_POSITIONS: list | None = None
+
+
+def set_base_positions(positions: list | None) -> None:
+    """设置用于拍卖算法的基地位置列表（每项为 [x,y,z]）。传入 None 可重置为默认（原点）。"""
+    global _BASE_POSITIONS
+    if positions is None:
+        _BASE_POSITIONS = None
+    else:
+        import numpy as _np
+        try:
+            _BASE_POSITIONS = [_np.asarray(p, dtype=np.float64) for p in positions]
+        except Exception:
+            _BASE_POSITIONS = None
+
 
 @dataclass(frozen=True)
 class AssignmentResult:
@@ -918,7 +934,19 @@ def _speed(drone: Any) -> float:
 
 
 def _norm_to_base_position(position: np.ndarray) -> float:
-    """计算坐标相对基地(原点)的距离。"""
+    """计算坐标相对基地的距离。
+
+    如果全局 `_BASE_POSITIONS` 被设置，则返回到最近基地的距离；否则回退到原点距离（兼容旧逻辑）。
+    """
+    global _BASE_POSITIONS
+    if _BASE_POSITIONS:
+        try:
+            import numpy as _np
+            pos = _np.asarray(position, dtype=_np.float64)
+            dists = [_np.linalg.norm(pos - bp) for bp in _BASE_POSITIONS]
+            return float(min(dists) if dists else _np.linalg.norm(pos))
+        except Exception:
+            return float(np.linalg.norm(position))
     return float(np.linalg.norm(position))
 
 

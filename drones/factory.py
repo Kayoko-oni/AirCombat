@@ -26,8 +26,32 @@ def create_anti_radiation_drone(name: str, position: list, config: dict, drones:
     """创建一架反辐射无人机并直接加入 drones 列表，同时初始化屏蔽方向"""
     drone_config = config.get("drones", {}).get("anti_radiation", {})
     drone = AntiRadiationDrone(name=name, position=position, config=drone_config)
-    # 固化屏蔽方向：从基地指向初始位置
-    base_pos = config.get("base", {}).get("position", [0.0, 0.0, 0.0])
+    # 固化屏蔽方向：在多基地配置下选择最近的基地（向后兼容单基地）
+    base_pos = None
+    bases = config.get("bases")
+    if isinstance(bases, list) and bases:
+        # 选择与初始位置最近的基地
+        try:
+            import math
+            best = None
+            best_dist = float("inf")
+            for b in bases:
+                bp = b.get("position")
+                if bp is None:
+                    continue
+                dx = position[0] - bp[0]
+                dy = position[1] - bp[1]
+                dz = position[2] - (bp[2] if len(bp) > 2 else 0.0)
+                dist = math.sqrt(dx * dx + dy * dy + dz * dz)
+                if dist < best_dist:
+                    best_dist = dist
+                    best = bp
+            base_pos = best or config.get("base", {}).get("position", [0.0, 0.0, 0.0])
+        except Exception:
+            base_pos = config.get("base", {}).get("position", [0.0, 0.0, 0.0])
+    else:
+        base_pos = config.get("base", {}).get("position", [0.0, 0.0, 0.0])
+
     drone.init_jamming_direction(base_pos)
     drones.append(drone)
 
