@@ -19,7 +19,7 @@ from Visual.render_utils import (
 
 
 class Open3DDisplay:
-    def __init__(self, map_size=(1000, 1000), obj_model_path=None):
+    def __init__(self, map_size=(1000, 1000), obj_model_path=None, enable_trails=True, enable_dashed_lines=True):
         try:
             import open3d as o3d
             from open3d.visualization import gui, rendering
@@ -27,6 +27,9 @@ class Open3DDisplay:
             raise ImportError(
                 "Open3D is required for visualization. Install it with `pip install open3d`."
             ) from exc
+
+        self.enable_trails = enable_trails          # 是否生成轨迹线
+        self.enable_dashed_lines = enable_dashed_lines  # 是否生成虚线连线
 
         self.o3d = o3d
         self.gui = gui
@@ -38,6 +41,10 @@ class Open3DDisplay:
         self.scene_widget = self.gui.SceneWidget()
         self.scene_widget.scene = self.rendering.Open3DScene(self.window.renderer)
         self.window.add_child(self.scene_widget)
+
+        self.drone_geoms = {}          # 存活无人机几何体名称 -> True
+        self.active_effects = {}       # 特效信息: key -> dict
+        self._effect_handled = set()   # 已经创建过特效的无人机名称（避免重复创建）
 
         # ── 美化 HUD：多标签堆叠面板（纯 ASCII，无 Unicode 方框）──
         # 颜色常量
@@ -376,11 +383,11 @@ class Open3DDisplay:
             return
 
         if not self.map_initialized:
-            self._init_map_data()   # 只执行一次，生成 self.buildings 和 self.map_grid
-
-        if not self.static_objects_added:  # 只在首次更新时添加静态物体（坐标轴、地面、基地模型）
+            self._init_map_data()
+        if not self.static_objects_added:
             self._add_static_objects(base_position)
 
+        # 清理每帧重建的动态几何体（轨迹、虚线等）
         for name in list(self.dynamic_geometries):
             try:
                 self.scene_widget.scene.remove_geometry(name)
@@ -391,94 +398,177 @@ class Open3DDisplay:
         offensive = [d for d in drones if d.drone_type in self.offensive_types and not d.destroyed]
         defensive = [d for d in drones if d.drone_type not in self.offensive_types and not d.destroyed]
 
+        # 记录当前存活无人机的名称，用于清理无人机几何体
+        current_drone_names = set()
+
+        # ===== 1. 处理存活无人机的模型移动和动态几何体 =====
         for drone in drones:
             if drone.destroyed:
-                if drone.impact:
-                    explosion_color = self._color_for_type(drone.drone_type)
-                    debris = create_explosion_mesh(drone.position, drone.death_timer, drone.death_effect_duration, color=explosion_color)
-                    material = self.rendering.MaterialRecord()
-                    material.base_color = explosion_color + (1.0,)
-                    self._safe_add_dynamic_geometry(f"explosion_{drone.name}", debris, material)
-                else:
-                    # 若为碰撞导致的坠毁，使用灰色无人机模型和灰色轨迹；否则沿用原有球体与颜色
-                    if getattr(drone, "death_cause", None) == "collision":
-                        fall_color = (0.8, 0.8, 0.8)
-                        mesh = create_drone_model_mesh(drone.position, color=fall_color)
-                    else:
-                        fall_color = self._color_for_type(drone.drone_type)
-                        mesh = create_drone_mesh(drone.position, color=fall_color)
-
-                    material = self.rendering.MaterialRecord()
-                    material.base_color = fall_color + (1.0,)
-                    self._safe_add_dynamic_geometry(f"falling_{drone.name}", mesh, material)
-                    if len(drone.trail) > 1:
-                        path = create_path_line(drone.trail, color=fall_color)
-                        if path is not None:
-                            material_trail = self.rendering.MaterialRecord()
-                            material_trail.shader = 'unlitLine'
-                            material_trail.base_color = fall_color + (1.0,)
-                            self._safe_add_dynamic_geometry(f"trail_{drone.name}", path, material_trail)
+                # 无人机被摧毁：清除其无人机几何体（如果还在）
+                name = f"drone_{drone.name}"
+                if name in self.drone_geoms:
+                    self.scene_widget.scene.remove_geometry(name)
+                    del self.drone_geoms[name]
                 continue
 
+            # 存活无人机
+            name = f"drone_{drone.name}"
+            current_drone_names.add(name)
             color = self._drone_color(drone)
-            mesh = create_drone_model_mesh(drone.position, color=color)
-            material = self.rendering.MaterialRecord()
-            material.base_color = color + (1.0,)
-            # TODO: 增加视觉效果
-            self._safe_add_dynamic_geometry(f"drone_{drone.name}", mesh, material)
 
-            if len(drone.trail) > 1:
+            # 无人机模型（矩阵移动）
+            if name not in self.drone_geoms:
+                mesh = create_drone_model_mesh(color=color)  # 中心在原点
+                material = self.rendering.MaterialRecord()
+                material.base_color = color + (1.0,)
+                self.scene_widget.scene.add_geometry(name, mesh, material)
+                self.drone_geoms[name] = True
+            mat = np.eye(4, dtype=np.float64)
+            mat[:3, 3] = drone.position[:3]
+            self.scene_widget.scene.set_geometry_transform(name, mat)
+
+            # 轨迹线（每帧重建）
+            if self.enable_trails and len(drone.trail) > 1:
+                trail_name = f"trail_{drone.name}"
+                # 先移除旧的几何体（忽略异常）
+                try:
+                    self.scene_widget.scene.remove_geometry(trail_name)
+                except Exception:
+                    pass
                 trail_color = self._color_for_type(drone.drone_type)
                 path = create_path_line(drone.trail, color=trail_color)
                 if path is not None:
                     material_trail = self.rendering.MaterialRecord()
                     material_trail.shader = 'unlitLine'
                     material_trail.base_color = trail_color + (1.0,)
-                    self._safe_add_dynamic_geometry(f"trail_{drone.name}", path, material_trail)
-            # 如果存在避障路径缓存（来自 PathTracker 或 CBS），可视化显示
-            # 优先显示防守方的 CBS 路径 (_cbs_path)（红色），其次显示个人避障路径 (_avoid_path)（绿色）
-            if self.show_paths:
-                try:
-                    if hasattr(drone, "_cbs_path") and drone._cbs_path:
-                        # 使用紫色来区分于进攻方轨迹（红色）
-                        p = create_path_line(drone._cbs_path, color=(0.6, 0.2, 0.8))
-                        if p is not None:
-                            material_p = self.rendering.MaterialRecord()
-                            material_p.shader = 'unlitLine'
-                            material_p.base_color = (0.6, 0.2, 0.8, 1.0)
-                            self._safe_add_dynamic_geometry(f"path_{drone.name}", p, material_p)
-                    elif hasattr(drone, "_avoid_path") and drone._avoid_path:
-                        p = create_path_line(drone._avoid_path, color=(0.2, 0.8, 0.2))
-                        if p is not None:
-                            material_p = self.rendering.MaterialRecord()
-                            material_p.shader = 'unlitLine'
-                            material_p.base_color = (0.2, 0.8, 0.2, 1.0)
-                            self._safe_add_dynamic_geometry(f"path_{drone.name}", p, material_p)
-                except Exception:
-                    pass
-            # 显示防守分配连线：若 defender 有 `_assigned_target` 属性，则用虚线显示到目标
-            try:
-                assigned = getattr(drone, "_assigned_target", None)
-                if assigned is not None and hasattr(assigned, "position") and getattr(assigned, "is_alive", lambda: True)():
-                    dash = create_dashed_line(drone.position, assigned.position, color=(1.0, 0.8, 0.0))
+                    self._safe_add_dynamic_geometry(trail_name, path, material_trail)
+
+            # 虚线连线（仅防守方）
+            if self.enable_dashed_lines and drone in defensive:
+                target = getattr(drone, "_assigned_target", None)
+                if target is not None and hasattr(target, "position") and target.is_alive():
+                    dash = create_dashed_line(drone.position, target.position, color=(1.0, 0.8, 0.0))
                     if dash is not None:
                         material_assign = self.rendering.MaterialRecord()
                         material_assign.shader = 'unlitLine'
                         material_assign.base_color = (1.0, 0.8, 0.0, 1.0)
                         self._safe_add_dynamic_geometry(f"assign_{drone.name}", dash, material_assign)
-            except Exception:
-                pass
 
+            # 可选：计算最近敌人距离（用于 HUD）
             enemies = defensive if drone in offensive else offensive
-            nearest_dist = self._nearest_enemy_distance(drone, enemies)
+            self._nearest_enemy_distance(drone, enemies)
 
-        # ── FPS 跟踪 ──
+        # ===== 2. 清理不再存活的无人机几何体 =====
+        for geom_name in list(self.drone_geoms.keys()):
+            if geom_name not in current_drone_names:
+                self.scene_widget.scene.remove_geometry(geom_name)
+                del self.drone_geoms[geom_name]
+
+        # ===== 3. 处理持久化的坠毁/爆炸特效 =====
+        import time
+        now = time.time()
+
+        # 第一步：为刚被摧毁且尚未处理特效的无人机创建特效
+        for drone in drones:
+            if drone.destroyed:
+                if drone.name in self._effect_handled:
+                    continue
+                effect_key = f"effect_{drone.name}"
+                if drone.impact:
+                    # 爆炸：球体从小到大
+                    explosion_mesh = self.o3d.geometry.TriangleMesh.create_sphere(radius=0.5)
+                    explosion_mesh.compute_vertex_normals()
+                    explosion_mesh.paint_uniform_color(self._color_for_type(drone.drone_type))
+                    self.scene_widget.scene.add_geometry(effect_key, explosion_mesh, self.rendering.MaterialRecord())
+                    self.active_effects[effect_key] = {
+                        'type': 'explosion',
+                        'start_time': now,
+                        'duration': drone.death_effect_duration,
+                        'start_pos': drone.position.copy(),
+                        'mesh': explosion_mesh,
+                        'initial_radius': 0.5,
+                        'final_radius': 6.0
+                    }
+                else:
+                    # 坠落：简单球体，匀加速下落
+                    fall_color = (0.4, 0.4, 0.4)
+                    fall_mesh = self.o3d.geometry.TriangleMesh.create_sphere(radius=3.0)
+                    fall_mesh.compute_vertex_normals()
+                    fall_mesh.paint_uniform_color(fall_color)
+                    self.scene_widget.scene.add_geometry(effect_key, fall_mesh, self.rendering.MaterialRecord())
+                    self.active_effects[effect_key] = {
+                        'type': 'falling',
+                        'start_time': now,
+                        'last_time': now,           # 添加
+                        'start_pos': drone.position.copy(),
+                        'mesh': fall_mesh,
+                        'ground_height': 0.0,
+                        'velocity': 0.0,            # 初速度0
+                        'gravity': -9.8
+                    }
+                self._effect_handled.add(drone.name)
+
+        # 第二步：更新所有已存在的特效
+        for effect_key, info in list(self.active_effects.items()):
+            elapsed = now - info['start_time']
+            if info['type'] == 'explosion':
+                if elapsed >= info['duration']:
+                    self.scene_widget.scene.remove_geometry(effect_key)
+                    del self.active_effects[effect_key]
+                    continue
+                t = elapsed / info['duration']
+                radius = info['initial_radius'] + (info['final_radius'] - info['initial_radius']) * t
+                scale = radius / info['initial_radius']
+                mat = np.eye(4, dtype=np.float64)
+                mat[0,0] = scale
+                mat[1,1] = scale
+                mat[2,2] = scale
+                mat[:3, 3] = info['start_pos']
+                self.scene_widget.scene.set_geometry_transform(effect_key, mat)
+            elif info['type'] == 'falling':
+                # 获取上次更新时间（如果没有，则用 start_time）
+                if 'last_time' not in info:
+                    info['last_time'] = info['start_time']
+                    info['velocity'] = 0.0
+                dt = now - info['last_time']
+                if dt > 0.05:  # 限制最大时间步长，避免跳跃过大
+                    dt = 0.05
+                # 更新速度：v = v + g * dt，限制最大速度 -15.0 m/s
+                info['velocity'] += info['gravity'] * dt
+                if info['velocity'] < -15.0:
+                    info['velocity'] = -15.0
+                # 更新位置
+                new_z = info['start_pos'][2] + info['velocity'] * dt
+                info['start_pos'][2] = new_z   # 更新当前高度，用于下一帧
+                if new_z <= info['ground_height']:
+                    new_z = info['ground_height']
+                    self.scene_widget.scene.remove_geometry(effect_key)
+                    del self.active_effects[effect_key]
+                    continue
+                mat = np.eye(4, dtype=np.float64)
+                mat[:3, 3] = [info['start_pos'][0], info['start_pos'][1], new_z]
+                self.scene_widget.scene.set_geometry_transform(effect_key, mat)
+                info['last_time'] = now
+
+        # 第三步：清理已经完全移除的无人机的特效记录
+        existing_drone_names = {d.name for d in drones}
+        for name in list(self._effect_handled):
+            if name not in existing_drone_names:
+                self._effect_handled.discard(name)
+        for effect_key in list(self.active_effects.keys()):
+            drone_name = effect_key[7:]  # 去掉 "effect_"
+            if drone_name not in existing_drone_names:
+                self.scene_widget.scene.remove_geometry(effect_key)
+                del self.active_effects[effect_key]
+                self._effect_handled.discard(drone_name)
+
+        # ===== 4. FPS 跟踪和 HUD 更新 =====
         import time as _time
-        now = _time.perf_counter()
+        now_ = _time.perf_counter()
         if not hasattr(self, '_last_fps_tick'):
-            self._last_fps_tick = now
-        dt = now - self._last_fps_tick
-        self._last_fps_tick = now
+            self._last_fps_tick = now_
+        dt = now_ - self._last_fps_tick
+        self._last_fps_tick = now_
         if dt > 0:
             self._fps_accum_time += dt
             self._fps_frame_count += 1
@@ -487,11 +577,10 @@ class Open3DDisplay:
                 self._fps_frame_count = 0
                 self._fps_accum_time = 0.0
 
-        # ── HUD 更新 ──
         if self._fps_current > 0:
             self._sim_elapsed += 1.0 / self._fps_current
         else:
-            self._sim_elapsed += 0.016  # ~60fps fallback
+            self._sim_elapsed += 0.016
         self._refresh_hud(drones, base_health)
 
         self.scene_widget.force_redraw()
@@ -509,3 +598,30 @@ class Open3DDisplay:
             self.app.quit()
         except Exception:
             pass
+
+    @staticmethod
+    def _dashed_line_points(start, end, dash_length=8.0, gap_length=6.0):
+        start = np.array(start)
+        end = np.array(end)
+        vec = end - start
+        dist = np.linalg.norm(vec)
+        if dist < 1e-6:
+            return None
+        dirv = vec / dist
+        segment = dash_length + gap_length
+        count = int(dist // segment)
+        points = []
+        for i in range(count):
+            s = start + dirv * (i * segment)
+            e = start + dirv * (i * segment + dash_length)
+            points.append(s)
+            points.append(e)
+        tail_start = count * segment
+        if tail_start < dist:
+            s = start + dirv * tail_start
+            e = start + dirv * min(tail_start + dash_length, dist)
+            points.append(s)
+            points.append(e)
+        if not points:
+            return None
+        return np.array(points)

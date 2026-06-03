@@ -110,6 +110,38 @@ def _apply_ew_jamming(drones: list, ew_drones: list) -> None:
         d._ew_jammed = jammed
 
 
+# 在文件顶部（例如 _ASSIGNMENT_CONFIG 后面）添加全局变量
+_LAST_ANTI_EW_SPAWN_TIME = 0.0
+_ANTI_EW_SPAWN_COOLDOWN = 2.0   # 冷却时间（秒）
+_MAX_ANTI_EW_RATIO = 1.5        # AntiEW 数量 / EW 数量 的上限
+
+def _spawn_anti_ew_if_needed(config: dict, drones: list, base_position: list):
+    global _LAST_ANTI_EW_SPAWN_TIME
+    import time
+    now = time.time()
+    if now - _LAST_ANTI_EW_SPAWN_TIME < _ANTI_EW_SPAWN_COOLDOWN:
+        return
+
+    ew_drones = _get_ew_drones(drones)
+    if not ew_drones:
+        return
+
+    existing_anti_ew = [d for d in drones if isinstance(d, AntiEWDrone) and d.is_alive()]
+    # 比例限制：AntiEW 数量不应超过 EW 数量的 _MAX_ANTI_EW_RATIO 倍
+    if len(existing_anti_ew) >= len(ew_drones) * _MAX_ANTI_EW_RATIO:
+        return
+
+    needed = len(ew_drones) - len(existing_anti_ew)
+    if needed <= 0:
+        return
+    # 每次最多生成 1 架，避免瞬间爆发
+    needed = min(needed, 1)
+    for _ in range(needed):
+        name = f"AntiEW-{random.randint(100, 999)}"
+        create_anti_ew_drone(name, [base_position[0], base_position[1], 50.0], config, drones)
+        LOGGER.info("Spawned AntiEW drone: %s at base", name)
+    _LAST_ANTI_EW_SPAWN_TIME = now
+
 def _check_anti_ew_disruption(ew_drones: list, anti_ew_drones: list) -> None:
     """检查反电子战无人机是否靠近 EW 无人机，靠近则永久关闭其干扰。"""
     for aew in anti_ew_drones:
@@ -125,26 +157,6 @@ def _check_anti_ew_disruption(ew_drones: list, anti_ew_drones: list) -> None:
                     "AntiEW %s disabled EW %s jamming (dist=%.1f)",
                     aew.name, ew.name, dist,
                 )
-
-
-def _spawn_anti_ew_if_needed(config: dict, drones: list, base_position: list):
-    """当存在活跃 EW 无人机且无 AntiEW 正在追击时，在基地生成一架 AntiEW。"""
-    ew_drones = _get_ew_drones(drones)
-    if not ew_drones:
-        return
-    existing_anti_ew = [
-        d for d in drones
-        if isinstance(d, AntiEWDrone) and d.is_alive()
-    ]
-    # 最多生成与活跃 EW 数量相同的 AntiEW
-    needed = len(ew_drones) - len(existing_anti_ew)
-    if needed <= 0:
-        return
-    for _ in range(needed):
-        name = f"AntiEW-{random.randint(100, 999)}"
-        # 在基地位置生成
-        create_anti_ew_drone(name, [base_position[0], base_position[1], 50.0], config, drones)
-        LOGGER.info("Spawned AntiEW drone: %s at base", name)
 
 
 # ====== 以下为原有 ARD 感知屏蔽工具 ======
@@ -648,9 +660,9 @@ def run_simulation(config: dict):
             obj_model_path = str(Path(__file__).resolve().parent / "Data" / "maps" / "3d66.com_JJI54558918189.obj")
             if os.path.exists(obj_model_path):
                 display = Open3DDisplay(map_size=(config["map"]["width"], config["map"]["height"]),
-                                        obj_model_path=obj_model_path)
+                                        obj_model_path=obj_model_path, enable_trails=True, enable_dashed_lines=True)
             else:
-                display = Open3DDisplay(map_size=(config["map"]["width"], config["map"]["height"]))
+                display = Open3DDisplay(map_size=(config["map"]["width"], config["map"]["height"]), enable_trails=True, enable_dashed_lines=True)
             display.open_window()
             display._init_map_data()
         except Exception as exc:

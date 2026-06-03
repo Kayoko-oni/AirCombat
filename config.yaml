@@ -23,10 +23,10 @@ simulation:
 
   # 生成新进攻无人机的时间间隔（秒），仿真可通过调大这两个值实现小规模测试
   # 为了默认方便调试，默认间隔设置为较大值，减少场景密度
-  spawn_interval_min: 1.0
-  spawn_interval_max: 6.0
+  spawn_interval_min: 1
+  spawn_interval_max: 2
   # 最大同时存在的进攻方数量（用于限制自动生成）
-  max_offensive: 6
+  max_offensive: 50
   # 进攻方初始化高度分布（低空+高空）
   offensive_spawn_z_low_min: 5.0
   offensive_spawn_z_low_max: 30.0
@@ -38,6 +38,7 @@ simulation:
   offensive_avoid_low_alt_threshold: 30.0 # 越大，更多高度会启用贴建筑绕行
   offensive_avoid_corridor_cells: 1 # 越大，越敏感（更容易触发 A*）
   offensive_avoid_sample_count: 8 # 越大，检测更严格但开销更高
+
   
 path_planning:
   # 路径重规划相关参数（可在调试时调整）
