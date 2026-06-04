@@ -407,21 +407,7 @@ def update_chase_strategy(drones, offensive_targets, assignment_cfg=None, map_gr
                 pos = tuple(drone.position[:3])
                 needs_plan = False
                 # 确定该进攻机的目标基地（最近的活跃基地）
-                if isinstance(offensive_targets, list) and offensive_targets and isinstance(offensive_targets[0], (list, tuple)):
-                    try:
-                        # 选择最近的基地
-                        def _dist_sq(a, b):
-                            return sum((p - q) ** 2 for p, q in zip(a, b))
-                        target_base = min(offensive_targets, key=lambda bp: _dist_sq(pos, bp))
-                    except Exception:
-                        target_base = offensive_targets[0]
-                else:
-                    target_base = offensive_targets
-
-                if line_of_sight_world is not None and not line_of_sight_world(pos, target_base, map_grid):
-                    needs_plan = True
-                if not needs_plan and _needs_obstacle_aware_path(pos, target_base, map_grid):
-                    needs_plan = True
+                used_light_plan = False
                 if needs_plan:
                     if a_star_plan_world is not None:
                         path = a_star_plan_world(pos, target_base, map_grid, max_time_ms=50)

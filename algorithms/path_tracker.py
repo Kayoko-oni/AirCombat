@@ -164,7 +164,10 @@ class PathTracker:
         if success:
             # 关键：如果路径长度 <= 2，说明几乎无遮挡，直接采用直线追逐
             if len(plan) <= 2:
-                self.path = None
+                # 虽然路径短，但仍使用该路径（或强制使用直线但提升高度）
+                # 这里可以选择提升高度后直线
+                climb_z = max(pos[2], 20.0)   # 提升到安全高度
+                return [pos[0], pos[1], climb_z]
                 self.goal = goal
                 self.last_replan = now
                 if self.debug_log:
@@ -184,7 +187,6 @@ class PathTracker:
             logger.info("Replan success: %s time=%.1fms len=%d", self.drone.name, elapsed_ms, len(plan))
             return self.path[self.idx] if self.idx < len(self.path) else None
         else:
-            # 规划失败，延长冷却至 5 秒，避免反复尝试
-            self.last_replan = now + 5.0
-            logger.warning("Replan failed for %s, cooldown 5s", self.drone.name)
-            return None
+            # 规划失败：返回爬升目标点，而不是 None
+           climb_z = max(pos[2], 20.0)
+        return [pos[0], pos[1], climb_z]
