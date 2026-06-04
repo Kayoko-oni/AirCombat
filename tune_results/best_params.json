@@ -1,0 +1,30 @@
+{
+  "timestamp": "2026-06-03T23:11:02.939288",
+  "generations": 30,
+  "evaluations": 360,
+  "best_score": 176.0,
+  "best_params": {
+    "attention_temperature": 0.8157,
+    "top_k_proposers": 4.0146,
+    "urgency_weight": 43.4978,
+    "load_balance_weight": 15.126,
+    "feasibility_weight": 12.2295,
+    "attention_weight": 19.0321,
+    "non_responder_penalty": 34.941,
+    "sticky_assignment_bonus": 10.1291,
+    "reassignment_penalty": 2.5058,
+    "communication_range": 363.8731
+  },
+  "defaults": {
+    "communication_range": 280.0,
+    "top_k_proposers": 2,
+    "attention_temperature": 0.7,
+    "urgency_weight": 35.0,
+    "load_balance_weight": 18.0,
+    "feasibility_weight": 16.0,
+    "attention_weight": 22.0,
+    "non_responder_penalty": 55.0,
+    "sticky_assignment_bonus": 10.0,
+    "reassignment_penalty": 6.0
+  }
+}

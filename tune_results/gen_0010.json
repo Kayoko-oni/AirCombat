@@ -1,0 +1,19 @@
+{
+  "generation": 10,
+  "best_score": 176.0,
+  "best_params": {
+    "attention_temperature": 0.8157,
+    "top_k_proposers": 4.0146,
+    "urgency_weight": 43.4978,
+    "load_balance_weight": 15.126,
+    "feasibility_weight": 12.2295,
+    "attention_weight": 19.0321,
+    "non_responder_penalty": 34.941,
+    "sticky_assignment_bonus": 10.1291,
+    "reassignment_penalty": 2.5058,
+    "communication_range": 363.8731
+  },
+  "mean_score": 79.67,
+  "std_score": 38.24,
+  "timestamp": "2026-06-03T22:58:22.562859"
+}

@@ -346,6 +346,10 @@ def greedy_assignment(
         jammed_mask:    可选布尔数组 [n_def]，True 表示该防守方被 EW 干扰
 
     返回：{防守方名称: 进攻方对象或 None}
+
+    回退保护:
+        - 若拍卖不收敛，先尝试 3x 迭代次数重试
+        - 若仍不收敛，降级为最近邻贪心分配，保证 30+ 无人机不崩溃
     """
 
     if not defenders:
@@ -358,28 +362,82 @@ def greedy_assignment(
 
     utility = _build_cma_enhanced_utility(defenders, attackers, cfg, map_grid=map_grid, jammed_mask=jammed_mask)
 
-    solver = ImprovedAuctionSolver(cfg)
     n_def, n_att = utility.shape
-
     assignment: Dict[str, Optional[Any]] = {d.name: None for d in defenders}
 
-    if n_def >= n_att:
-        # 拍卖求解结果含义：task_to_agent[进攻方索引] = 防守方索引。
-        result = solver.solve(utility)
-        for attacker_idx, defender_idx in enumerate(result.task_to_agent.tolist()):
-            defender = defenders[int(defender_idx)]
-            assignment[defender.name] = attackers[attacker_idx]
-        _remember_assignment(assignment)
-        return assignment
-
-    # 当防守方少于进攻方时，对转置矩阵求解，保证每个防守方仍只匹配一个目标，
-    # 同时保持一对一约束不被破坏。
-    transposed_result = solver.solve(utility.T)
-    for defender_idx, attacker_idx in enumerate(transposed_result.task_to_agent.tolist()):
-        defender = defenders[defender_idx]
-        assignment[defender.name] = attackers[int(attacker_idx)]
+    # ── 带回退保护的拍卖求解 ──
+    try:
+        if n_def >= n_att:
+            result = _solve_with_fallback(utility, cfg, n_def, n_att, transposed=False)
+            for attacker_idx, defender_idx in enumerate(result.task_to_agent.tolist()):
+                defender = defenders[int(defender_idx)]
+                assignment[defender.name] = attackers[attacker_idx]
+        else:
+            result = _solve_with_fallback(utility.T, cfg, n_att, n_def, transposed=True)
+            for defender_idx, attacker_idx in enumerate(result.task_to_agent.tolist()):
+                defender = defenders[defender_idx]
+                assignment[defender.name] = attackers[int(attacker_idx)]
+    except RuntimeError:
+        # 两次拍卖均失败 → 降级为最近邻贪心
+        assignment = _nearest_neighbor_assignment(defenders, attackers)
 
     _remember_assignment(assignment)
+    return assignment
+
+
+def _solve_with_fallback(
+    utility: np.ndarray,
+    cfg: ImprovedAuctionConfig,
+    n_agents: int,
+    n_tasks: int,
+    transposed: bool,
+) -> AssignmentResult:
+    """带一级重试的拍卖求解：不收敛时用 3x 迭代再试一次。"""
+    solver = ImprovedAuctionSolver(cfg)
+    try:
+        return solver.solve(utility)
+    except RuntimeError as exc:
+        if "did not converge" not in str(exc):
+            raise
+        # 重试：放宽迭代上限为原来的 3 倍
+        from dataclasses import replace
+        retry_cfg = replace(cfg, max_iterations_per_phase=cfg.max_iterations_per_phase * 3)
+        retry_solver = ImprovedAuctionSolver(retry_cfg)
+        return retry_solver.solve(utility)
+
+
+def _nearest_neighbor_assignment(
+    defenders: List[Any],
+    attackers: List[Any],
+) -> Dict[str, Optional[Any]]:
+    """最近邻贪心分配 —— 拍卖完全失败时的最终回退。
+
+    按防守方顺序，每人贪心地选择距离最近且尚未被分配的进攻方。
+    """
+    assignment: Dict[str, Optional[Any]] = {d.name: None for d in defenders}
+    if not attackers:
+        return assignment
+
+    defender_positions = np.zeros((len(defenders), 3), dtype=np.float64)
+    for i, d in enumerate(defenders):
+        pos = getattr(d, "position", [0.0, 0.0, 0.0])
+        defender_positions[i] = np.asarray(pos[:3], dtype=np.float64)
+
+    attacker_positions = np.zeros((len(attackers), 3), dtype=np.float64)
+    for j, a in enumerate(attackers):
+        pos = getattr(a, "position", [0.0, 0.0, 0.0])
+        attacker_positions[j] = np.asarray(pos[:3], dtype=np.float64)
+
+    remaining = set(range(len(attackers)))
+    for i, defender in enumerate(defenders):
+        if not remaining:
+            break
+        best_j = min(remaining, key=lambda j: float(
+            np.linalg.norm(defender_positions[i] - attacker_positions[j])
+        ))
+        assignment[defender.name] = attackers[best_j]
+        remaining.discard(best_j)
+
     return assignment
 
 
