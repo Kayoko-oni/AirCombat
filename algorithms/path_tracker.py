@@ -39,8 +39,8 @@ class PathTracker:
         self.climb_target_z: Optional[float] = None
         # load defaults
         self.replan_distance = 1.0  # 米，目标变化超过此距离将触发重规划
-        self.replan_cooldown = 0.5  # 秒，最小重规划间隔
-        self.max_plan_time_ms = 50  # 毫秒
+        self.replan_cooldown = 2.0  # 秒，最小重规划间隔
+        self.max_plan_time_ms = 30  # 毫秒
         self.path_tolerance = 1.0   # 米，小于此认为到达路径点
         self.debug_log = False
         self.climb_clearance = 5.0  # 米，爬升时需高出障碍的安全高度
@@ -122,9 +122,9 @@ class PathTracker:
             # 若路径仍有效，返回当前航点
             return self.path[self.idx]
 
-        # 限制重规划频率
+         # 限制重规划频率（使用 self.last_replan 判断）
         if now - self.last_replan < self.replan_cooldown:
-            # 如果有旧路径可用，继续使用，否则直接返回 None（直追）
+            # 如果有旧路径且未用完，继续使用
             if self.path is not None and self.idx < len(self.path):
                 return self.path[self.idx]
             return None
@@ -162,18 +162,29 @@ class PathTracker:
         elapsed_ms = (time.time() - t0) * 1000.0
         success = bool(plan)
         if success:
+            # 关键：如果路径长度 <= 2，说明几乎无遮挡，直接采用直线追逐
+            if len(plan) <= 2:
+                self.path = None
+                self.goal = goal
+                self.last_replan = now
+                if self.debug_log:
+                    logger.debug("Path too short (len=%d), direct chase for %s", len(plan), self.drone.name)
+                return None
+
+            # 正常使用路径
             self.path = plan
             self.idx = 1 if len(plan) > 1 else 0
             self.goal = goal
             self.last_replan = now
-            # 将路径缓存到无人机对象，便于可视化/调试
             try:
                 self.drone._avoid_path = self.path
             except Exception:
                 pass
-            logger.info("Replan success: drone=%s time=%.1fms path_len=%d", getattr(self.drone, "name", "?"), elapsed_ms, len(plan))
+            # 将 info 改为 debug 减少刷屏（可选）
+            logger.info("Replan success: %s time=%.1fms len=%d", self.drone.name, elapsed_ms, len(plan))
             return self.path[self.idx] if self.idx < len(self.path) else None
         else:
-            self.last_replan = now
-            logger.info("Replan failed: drone=%s time=%.1fms", getattr(self.drone, "name", "?"), elapsed_ms)
+            # 规划失败，延长冷却至 5 秒，避免反复尝试
+            self.last_replan = now + 5.0
+            logger.warning("Replan failed for %s, cooldown 5s", self.drone.name)
             return None

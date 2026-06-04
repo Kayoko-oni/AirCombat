@@ -13,7 +13,7 @@ map:
 base:
   health: 100
   position: [-10, -25, 0]
-  collision_radius: 12.5
+  collision_radius: 20
 
 # 新增多基地配置（向后兼容：若存在 bases 则使用 bases，否则使用 base 下的单基地配置）
 bases:
@@ -26,7 +26,7 @@ bases:
     health: 100
     collision_radius: 15
   - name: Base-Charlie
-    position: [-290, 180, 0]
+    position: [-190, 120, 0]
     health: 100
     collision_radius: 15
 
@@ -50,16 +50,16 @@ simulation:
   offensive_spawn_high_ratio: 0.5
   # 进攻方低空贴建筑绕行设置
   offensive_obstacle_avoid: true
-  offensive_avoid_low_alt_threshold: 30.0 # 越大，更多高度会启用贴建筑绕行
+  offensive_avoid_low_alt_threshold: 50.0 # 越大，更多高度会启用贴建筑绕行
   offensive_avoid_corridor_cells: 1 # 越大，越敏感（更容易触发 A*）
-  offensive_avoid_sample_count: 8 # 越大，检测更严格但开销更高
+  offensive_avoid_sample_count: 6 # 越大，检测更严格但开销更高
 
   
 path_planning:
   # 路径重规划相关参数（可在调试时调整）
   replan_distance: 1.0      # 米，目标发生移动超过该距离触发重规划
-  replan_cooldown: 0.5      # 秒，重规划的最小间隔
-  max_plan_time_ms: 50     # 毫秒，单次 A* 规划的时间上限
+  replan_cooldown: 2.0      # 秒，重规划的最小间隔
+  max_plan_time_ms: 30     # 毫秒，单次 A* 规划的时间上限
   path_tolerance: 1.0       # 米，认为已到达路径点的容差
   debug_log: false          # 是否记录重规划日志到 stdout
   # 爬升避障相关（当地面路径被高楼阻挡时，先爬升再继续）

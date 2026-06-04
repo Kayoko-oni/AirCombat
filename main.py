@@ -1,6 +1,7 @@
 import math
 import random
 import time
+import msvcrt
 from dataclasses import fields
 from pathlib import Path
 
@@ -275,6 +276,13 @@ def update_chase_strategy(drones, offensive_targets, assignment_cfg=None, map_gr
 
     兼容性：当 map_grid 为 None 时，退化为原有的直接追逐逻辑。
     """
+    # ========== 冷却机制初始化（只需一次） ==========
+    if not hasattr(update_chase_strategy, "_last_cbs_time"):
+        update_chase_strategy._last_cbs_time = 0.0
+        update_chase_strategy._last_cbs_paths = None
+    current_time = time.time()
+    CBS_REPLAN_INTERVAL = 1.0   # 秒，可根据需要调整（0.5 ~ 2.0）
+    # =============================================
     if base_positions is None:
         base_positions = []
 
@@ -534,12 +542,38 @@ def update_chase_strategy(drones, offensive_targets, assignment_cfg=None, map_gr
                 defender.set_velocity([0.0, 0.0, 0.0])
 
         if map_grid is not None and pairs:
-            try:
-                from algorithms.cbs_pathplan import cbs_plan_paths
-                plan_inputs = [(p[0], p[1]) for p in pairs]
-                world_paths = cbs_plan_paths(plan_inputs, map_grid=map_grid)
-            except Exception:
-                world_paths = []
+            # 检查是否需要重新规划（冷却控制）
+            need_replan = (current_time - update_chase_strategy._last_cbs_time) >= CBS_REPLAN_INTERVAL
+            
+            if need_replan:
+                try:
+                    from algorithms.cbs_pathplan import cbs_plan_paths
+                    plan_inputs = [(p[0], p[1]) for p in pairs]
+                    world_paths = cbs_plan_paths(plan_inputs, map_grid=map_grid)
+                    # 更新缓存
+                    update_chase_strategy._last_cbs_time = current_time
+                    update_chase_strategy._last_cbs_paths = world_paths
+                except Exception:
+                    world_paths = []
+                    update_chase_strategy._last_cbs_paths = []
+            else:
+                # 使用上次缓存的路径，但需检查长度是否匹配
+                if (update_chase_strategy._last_cbs_paths is not None and 
+                    len(update_chase_strategy._last_cbs_paths) == len(defenders_order)):
+                    world_paths = update_chase_strategy._last_cbs_paths
+                else:
+                    # 长度不匹配，强制重规划（将 need_replan 设为 True）
+                    need_replan = True
+                    # 重新执行规划（可复制 need_replan 分支的代码，或直接递归调用，简单起见可以再次调用 cbs_plan_paths）
+                    try:
+                        from algorithms.cbs_pathplan import cbs_plan_paths
+                        plan_inputs = [(p[0], p[1]) for p in pairs]
+                        world_paths = cbs_plan_paths(plan_inputs, map_grid=map_grid)
+                        update_chase_strategy._last_cbs_time = current_time
+                        update_chase_strategy._last_cbs_paths = world_paths
+                    except Exception:
+                        world_paths = []
+                        update_chase_strategy._last_cbs_paths = []
 
             if world_paths:
                 for defender, path in zip(defenders_order, world_paths):
@@ -558,6 +592,7 @@ def update_chase_strategy(drones, offensive_targets, assignment_cfg=None, map_gr
                         if target_obj is not None:
                             chase_target(defender, target_obj)
             else:
+                # 规划失败或无路径，退化为直接追逐
                 for def_name, target in assignment.items():
                     defender = name_to_defender.get(def_name)
                     if defender is None:
@@ -566,15 +601,6 @@ def update_chase_strategy(drones, offensive_targets, assignment_cfg=None, map_gr
                         chase_target(defender, target)
                     else:
                         defender.set_velocity([0.0, 0.0, 0.0])
-        else:
-            for def_name, target in assignment.items():
-                defender = name_to_defender.get(def_name)
-                if defender is None:
-                    continue
-                if target is not None:
-                    chase_target(defender, target)
-                else:
-                    defender.set_velocity([0.0, 0.0, 0.0])
     elif free_defenders:
         for defender in free_defenders:
             defender.set_velocity([0.0, 0.0, 0.0])
@@ -806,26 +832,61 @@ def run_simulation(config: dict):
     except Exception:
         pass
 
-    #将帧率fps的值设置为配置中simulation-fps的值
-    #frame_time 为一帧所持续的时间
-    #start_time 仿真开始的时间, 设置为从time.time()中获取的系统绝对时间
-    #duration 仿真的持续时间, 从配置中的simulation-duration中获取
-    #下一次无人机生成的时间, 在 1~3 之间生成一个随机数 (这里之后肯定是要改掉的)
-    #进攻无人机生成时间的计时器初始化为0, 其值随着时间的进行同步增加, 当其大于next_spawn_time时生成新无人机(之后肯定要改掉的)
+    # ---------- 终端按键重置路径规划 ----------
+    # 仅在 Windows 下尝试导入 msvcrt，非 Windows 则禁用按键功能
+    try:
+        import msvcrt
+        _keyboard_available = True
+    except ImportError:
+        _keyboard_available = False
+        LOGGER.warning("msvcrt not available (non-Windows), terminal reset key disabled")
 
+    def reset_all_paths():
+        """强制重置所有无人机的路径规划状态"""
+        LOGGER.info("Manual reset: clearing all path planning states")
+        for drone in drones:
+            # 进攻方 A* 路径
+            if hasattr(drone, '_avoid_path'):
+                delattr(drone, '_avoid_path')
+            if hasattr(drone, '_avoid_idx'):
+                delattr(drone, '_avoid_idx')
+            # PathTracker 缓存
+            if hasattr(drone, '_path_tracker'):
+                drone._path_tracker = None
+            # 防守方 CBS 路径
+            if hasattr(drone, '_cbs_path'):
+                delattr(drone, '_cbs_path')
+            if hasattr(drone, '_cbs_goal'):
+                delattr(drone, '_cbs_goal')
+            # 分配目标标记
+            if hasattr(drone, '_assigned_target'):
+                drone._assigned_target = None
+        # 重置全局 CBS 缓存
+        if hasattr(update_chase_strategy, '_last_cbs_time'):
+            update_chase_strategy._last_cbs_time = 0.0
+        if hasattr(update_chase_strategy, '_last_cbs_paths'):
+            update_chase_strategy._last_cbs_paths = None
+        LOGGER.info("Reset completed")
+    # ------------------------------------------
 
+    frame_counter = 0
+    total_frame_time = 0.0
     try:
         while (duration <= 0 or time.time() - start_time < duration) and not base_manager.is_destroyed():
             # 当 duration<=0 时表示无限运行，否则按配置时长运行, 同时如果基地被摧毁了也要结束仿真
-
+            frame_start = time.perf_counter()   # 修正1：定义帧开始时间
             #1.碰撞检测与处理
+            t1 = time.perf_counter()
             collisions = detect_collisions(drones)  # 收集这一帧中发生碰撞的无人机的列表"""
             if collisions:
                 resolve_collisions(collisions)  #如果在这一帧中发生了碰撞, 那么对发生碰撞的无人机对执行resolve_collisions中的碰撞处理函数"""
+            t_collision = time.perf_counter() - t1
 
             #2. 更新每架无人机的电量, 如果电量耗尽则触发坠毁流程
+            t1 = time.perf_counter()
             for drone in drones:
                 drone.update_battery(frame_time)
+            t_battery = time.perf_counter() - t1
 
             #3. 更新坠毁无人机的状态
             for drone in drones:
@@ -866,6 +927,7 @@ def run_simulation(config: dict):
 
             #6. 更新存活无人机的追逐策略
             # 将 display.map_grid 传入路径规划模块；若 display 不存在则传入 None
+            t1 = time.perf_counter()
             update_chase_strategy(
                 alive_drones,
                 base_positions,
@@ -873,20 +935,25 @@ def run_simulation(config: dict):
                 map_grid=(display.map_grid if display is not None else None),
                 base_positions=base_positions,
             ) # 进攻方的目标点为基地列表（每架机将选择最近基地）
+            t_chase = time.perf_counter() - t1
 
             #6.5 检测 EW 无人机，生成 AntiEW 应对
             _spawn_anti_ew_if_needed(config, alive_drones, base_positions)
             # 更新每架无人机的追逐策略 """
 
             #7. 更新存活无人机的位置
+            t1 = time.perf_counter()
             for drone in alive_drones:
-                move_drone(drone, frame_time)
+                move_drone(drone, frame_time, map_grid=(display.map_grid if display else None))
             #对在alive_drone列表中(也就是确认存活的)无人机, 执行位置更新操作"""
+            t_move = time.perf_counter() - t1
 
             #8. 基地碰撞检测
+            t1 = time.perf_counter()
             if base_manager.check_collisions(drones):
                 LOGGER.info("Base destroyed! Attackers win!")
                 break
+            t_base_collision = time.perf_counter() - t1
 
             #9. 随机生成进攻无人机
             spawn_timer += frame_time  #随机生成进攻方无人机
@@ -900,6 +967,7 @@ def run_simulation(config: dict):
             balance_defenders(config, drones) #每帧立即平衡防守方数量, 直到防守方数量 >= 进攻方数量"""
 
             detections = []
+            t1 = time.perf_counter()
             #雷达模块已移除，进攻方目标全局可知
             LOGGER.debug("Detected %d objects", len(detections))
             if display is not None:
@@ -913,13 +981,35 @@ def run_simulation(config: dict):
                 if not display.app.run_one_tick():
                     LOGGER.info("GUI event loop ended.")
                     break
+            t_vis = time.perf_counter() - t1
+    
+            frame_end = time.perf_counter()
+            frame_total = frame_end - frame_start
+
+            # 慢帧警告（包含所有计时指标）
+            if frame_total > 0.05:   # 50ms
+                LOGGER.warning(
+                    f"Slow frame: {frame_total*1000:.1f}ms | "
+                    f"Collision:{t_collision*1000:.2f}ms Battery:{t_battery*1000:.2f}ms "
+                    f"Chase:{t_chase*1000:.2f}ms Move:{t_move*1000:.2f}ms "
+                    f"BaseCollision:{t_base_collision*1000:.2f}ms Vis:{t_vis*1000:.2f}ms"
+                )
+            # ---------- 终端按键检测（重置路径）----------
+            if _keyboard_available and msvcrt.kbhit():
+                try:
+                    key = msvcrt.getch().decode('ascii').lower()
+                    if key == 'r':
+                        reset_all_paths()
+                except Exception:
+                    pass
+            # -------------------------------------------
+
             time.sleep(frame_time)
     finally:
         if display is not None:
             display.close_window()
-            #如果上面的try中发生错误, 则直接执行finally中的代码, 使仿真出错时可以正常退出程序"""
-
-
+            time.sleep(0.2)   # 增加这一行，等待 Open3D 清理
+            #如果上面的try中发生错误, 则直接执行finally中的代码, 使仿真出错时可以正常退出程序
 
 if __name__ == "__main__":
     #此处为程序的入口

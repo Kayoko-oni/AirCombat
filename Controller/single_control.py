@@ -6,7 +6,9 @@ from drones.base_drone import BaseDrone
 from utils.geometry import clamp_position
 import time
 from typing import Optional
+from utils.logger import get_logger
 
+LOGGER = get_logger(__name__)
 # 使用算法模块提供的轻量 A* 与视线检测工具
 try:
     from algorithms.cbs_pathplan import a_star_plan_world, line_of_sight_world
@@ -19,7 +21,7 @@ except Exception:
     PathTracker = None
 
 
-def move_drone(drone: BaseDrone, delta_time: float) -> None:
+def move_drone(drone: BaseDrone, delta_time: float, map_grid=None) -> None:
     """ 对目标无人机进行移动, 参数为一个无人机对象以及delta_time步长, 直接修改无人机对象, 不返回值 """
     if not drone.is_alive():
         return

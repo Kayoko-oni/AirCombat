@@ -17,6 +17,9 @@
 import heapq
 import time
 from typing import List, Tuple, Optional, Any
+from utils.logger import get_logger
+
+LOGGER = get_logger(__name__)
 
 
 def _extract_positions(item: Any) -> Optional[Tuple[Tuple[float, float, float], Tuple[float, float, float]]]:
@@ -341,30 +344,36 @@ def line_of_sight_world(p1: Tuple[float, float, float], p2: Tuple[float, float, 
     return _line_of_sight(a, b, map_grid)
 
 
-def a_star_plan_world(start_world: Tuple[float, float, float], goal_world: Tuple[float, float, float], map_grid, max_time_ms: int = 50) -> List[List[float]]:
-    """在世界坐标下执行 A*，返回世界坐标路径 [[x,y,z], ...] 或空列表。"""
+def a_star_plan_world(start_world, goal_world, map_grid, max_time_ms=50):
     if map_grid is None:
         return []
+    # 增加起点/终点有效性检查
     sgx, sgy = map_grid.world_to_grid(start_world[0], start_world[1])
     ggx, ggy = map_grid.world_to_grid(goal_world[0], goal_world[1])
-    # 若起点或目标位于障碍上，尝试寻找附近空位
+    
+    # 如果起点/终点在障碍物内，尝试校正
     if map_grid.is_grid_occupied(sgx, sgy):
-        nf = _find_nearest_free(sgx, sgy, map_grid, max_radius=3)
-        if nf is None:
+        nearest = _find_nearest_free(sgx, sgy, map_grid, max_radius=5)
+        if nearest:
+            sgx, sgy = nearest
+        else:
+            LOGGER.warning("a_star_plan_world: start point stuck in obstacle, no free cell")
             return []
-        sgx, sgy = nf
     if map_grid.is_grid_occupied(ggx, ggy):
-        nf = _find_nearest_free(ggx, ggy, map_grid, max_radius=5)
-        if nf is None:
+        nearest = _find_nearest_free(ggx, ggy, map_grid, max_radius=10)
+        if nearest:
+            ggx, ggy = nearest
+        else:
+            LOGGER.warning("a_star_plan_world: goal point stuck in obstacle, no free cell")
             return []
-        ggx, ggy = nf
-
-    grid_path = _a_star_on_grid((sgx, sgy), (ggx, ggy), map_grid, [], time_limit_s=max_time_ms / 1000.0)
+    
+    # 强制使用目标点的高度（解决不下降问题）
+    z = goal_world[2]  # 直接使用目标高度，不再回退
+    
+    grid_path = _a_star_on_grid((sgx, sgy), (ggx, ggy), map_grid, [], time_limit_s=max_time_ms/1000.0, max_steps=5000)
     if not grid_path:
         return []
-
     smooth = _smooth_grid_path(grid_path, map_grid)
-    z = goal_world[2] if goal_world[2] != 0.0 else start_world[2]
     world_path = []
     for gx, gy in smooth:
         x, y = map_grid.grid_to_world(gx, gy)
