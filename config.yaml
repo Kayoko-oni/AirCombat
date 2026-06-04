@@ -62,22 +62,22 @@ assignment:
   enable_local_refine: true
   local_refine_rounds: 6
 
-  communication_range: 320.0 # 通信参数
+  communication_range: 364 # 通信参数
   max_operational_distance: 1200.0
   response_distance_weight: 0.5
   response_energy_weight: 0.35
   response_health_weight: 0.15
   response_threshold: 0.38
 
-  attention_temperature: 0.6 # 约束条件参数
-  distance_weight: 1.0
-  urgency_weight: 32.0
-  load_balance_weight: 20.0
-  feasibility_weight: 18.0
-  attention_weight: 24.0
-  non_responder_penalty: 60.0
-  sticky_assignment_bonus: 12.0
-  reassignment_penalty: 7.0
+  attention_temperature: 0.8157 # 约束条件参数
+  top_k_proposers: 4
+  urgency_weight: 43.4978
+  load_balance_weight: 15.126
+  feasibility_weight: 12.2295
+  attention_weight: 19.0321
+  non_responder_penalty: 34.941
+  sticky_assignment_bonus: 10.1291
+  reassignment_penalty: 2.5058
 
   # 高度权重距离配置
   height_weight: 1.5
