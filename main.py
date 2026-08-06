@@ -934,6 +934,14 @@ def run_simulation(config: dict):
             #对在alive_drone列表中(也就是确认存活的)无人机, 执行位置更新操作"""
             t_move = time.perf_counter() - t1
 
+            # 7.5 自动销毁超出地图边界两倍的无人机
+            map_limit = 1000  # 两倍于地图半宽500
+            for drone in alive_drones:
+                if abs(drone.position[0]) > map_limit or abs(drone.position[1]) > map_limit:
+                    LOGGER.info(f"{drone.name} out of bounds at {drone.position}, destroyed.")
+                    drone.death_cause = "out_of_bounds"
+                    drone.apply_damage(drone.health)  # 直接摧毁
+
             #8. 基地碰撞检测
             t1 = time.perf_counter()
             if base_manager.check_collisions(drones):

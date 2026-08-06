@@ -367,7 +367,7 @@ def a_star_plan_world(start_world, goal_world, map_grid, max_time_ms=50):
             LOGGER.warning("a_star_plan_world: goal point stuck in obstacle, no free cell")
             return []
     
-    # 强制使用目标点的高度（解决不下降问题）
+    # 强制使用目标点的高度
     z = goal_world[2]  # 直接使用目标高度，不再回退
     
     grid_path = _a_star_on_grid((sgx, sgy), (ggx, ggy), map_grid, [], time_limit_s=max_time_ms/1000.0, max_steps=5000)
