@@ -11,7 +11,7 @@ map:
     max_attempts_per_building: 2000
   # TODO: 添加边界定义和障碍物
 base:
-  health: 100
+  health: 10000
   position: [-10, -25, 0]
   collision_radius: 20
 
@@ -32,16 +32,20 @@ bases:
 
 simulation:
   fps: 30
-  duration: 300
+  duration: 0
   # 0 表示无限运行时间，直到手动关闭程序
   # TODO: 添加暂停/恢复控制和保存/加载状态
 
-  # 生成新进攻无人机的时间间隔（秒），仿真可通过调大这两个值实现小规模测试
-  # 为了默认方便调试，默认间隔设置为较大值，减少场景密度
-  spawn_interval_min: 1
-  spawn_interval_max: 2
-  # 最大同时存在的进攻方数量（用于限制自动生成）
-  max_offensive: 50
+  # 生成新进攻无人机的时间间隔（秒）- 调整为更快的生成速度
+  spawn_interval_min: 0.2   # 最小0.3秒生成一个
+  spawn_interval_max: 0.2   # 最大0.8秒生成一个
+  
+  # 最大同时存在的进攻方数量 - 调高到100
+  max_offensive: 200
+  
+  # 防守方自动平衡相关 - 增加到进攻方的1.2倍
+  defender_ratio: 1.2       # 防守方数量 = 进攻方 * 1.2
+  
   # 进攻方初始化高度分布（低空+高空）
   offensive_spawn_z_low_min: 5.0
   offensive_spawn_z_low_max: 30.0
@@ -53,6 +57,10 @@ simulation:
   offensive_avoid_low_alt_threshold: 50.0 # 越大，更多高度会启用贴建筑绕行
   offensive_avoid_corridor_cells: 1 # 越大，越敏感（更容易触发 A*）
   offensive_avoid_sample_count: 6 # 越大，检测更严格但开销更高
+  
+  # 反辐射无人机生成概率（提高以增加多样性）
+  anti_radiation_spawn_prob: 0.20   # 20%概率生成反辐射无人机
+  ew_spawn_prob: 0.15               # 15%概率生成电子战无人机
 
   
 path_planning:
@@ -141,4 +149,3 @@ drones:
     health: 90.0
     attack_power: 20.0
     battery: 90.0
-

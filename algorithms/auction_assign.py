@@ -19,6 +19,12 @@ try:
 except Exception:
     _geo_to_local_enu = None
 
+try:
+    import algorithms.cbs_pathplan as _cbs_pathplan_module
+    _line_of_sight_world_fn = getattr(_cbs_pathplan_module, "line_of_sight_world", None)
+except Exception:
+    _line_of_sight_world_fn = None
+
 # 可选的全局基地位置列表（由仿真主循环设置），用于将攻击方距离归一化到最近基地
 _BASE_POSITIONS: list | None = None
 
@@ -95,6 +101,10 @@ class ImprovedAuctionConfig:
     spatial_cell_size: float = 120.0
     spatial_query_radius: float = 0.0
     out_of_range_penalty: float = 1.0e6
+    enable_fast_fallback: bool = True
+    fast_assignment_pair_threshold: int = 2500
+    fast_assignment_max_agents: int = 36
+    fast_assignment_max_tasks: int = 36
     urgency_weight: float = 35.0
     load_balance_weight: float = 18.0
     feasibility_weight: float = 16.0
@@ -372,6 +382,15 @@ def greedy_assignment(
 
     cfg = config or ImprovedAuctionConfig()
 
+    n_def = len(defenders)
+    n_att = len(attackers)
+    if cfg.enable_fast_fallback and (
+        n_def * n_att >= cfg.fast_assignment_pair_threshold
+        or n_def >= cfg.fast_assignment_max_agents
+        or n_att >= cfg.fast_assignment_max_tasks
+    ):
+        return _nearest_neighbor_assignment(defenders, attackers, cfg, map_grid=map_grid, jammed_mask=jammed_mask)
+
     utility = _build_cma_enhanced_utility(defenders, attackers, cfg, map_grid=map_grid, jammed_mask=jammed_mask)
 
     solver = ImprovedAuctionSolver(cfg)
@@ -557,19 +576,61 @@ def _line_of_sight(
             return True
         min_z = min(float(p1[2]), float(p2[2]))
         return min_z > max_h + height_margin
-    try:
-        from algorithms.cbs_pathplan import line_of_sight_world
-    except Exception:
-        line_of_sight_world = None
-    if line_of_sight_world is None:
+    if _line_of_sight_world_fn is None:
         return True
-    return bool(line_of_sight_world(tuple(p1), tuple(p2), map_grid))
+    return bool(_line_of_sight_world_fn(tuple(p1), tuple(p2), map_grid))
 
 
 def _weighted_distance(pos_a: np.ndarray, pos_b: np.ndarray, height_weight: float) -> float:
     delta = pos_a - pos_b
     dz = delta[2] * abs(height_weight)
     return float(np.sqrt(delta[0] * delta[0] + delta[1] * delta[1] + dz * dz))
+
+
+def _nearest_neighbor_assignment(
+    defenders: List[Any],
+    attackers: List[Any],
+    cfg: ImprovedAuctionConfig,
+    map_grid: Optional[Any] = None,
+    jammed_mask: Optional[np.ndarray] = None,
+) -> Dict[str, Optional[Any]]:
+    assignment: Dict[str, Optional[Any]] = {d.name: None for d in defenders}
+    if not defenders or not attackers:
+        return assignment
+
+    defender_positions = _build_positions(defenders, cfg)
+    attacker_positions = _build_positions(attackers, cfg)
+    distance_matrix = _pairwise_distance_matrix(defender_positions, attacker_positions, cfg.height_weight)
+
+    free_attackers = set(range(len(attackers)))
+    defender_order = []
+    for idx, defender in enumerate(defenders):
+        if jammed_mask is not None and jammed_mask[idx]:
+            continue
+        if attacker_positions.size == 0:
+            dist_to_closest = float("inf")
+        else:
+            dist_to_closest = float(np.min(distance_matrix[idx]))
+        defender_order.append((
+            _estimate_defender_load(defender),
+            dist_to_closest,
+            idx,
+        ))
+    defender_order.sort(key=lambda item: (item[0], item[1]))
+
+    for _, _, defender_idx in defender_order:
+        if not free_attackers:
+            break
+        defender = defenders[defender_idx]
+        attacker_indices = sorted(free_attackers, key=lambda a: float(distance_matrix[defender_idx, a]))
+        for attacker_idx in attacker_indices:
+            if distance_matrix[defender_idx, attacker_idx] <= cfg.max_operational_distance:
+                assignment[defender.name] = attackers[attacker_idx]
+                free_attackers.remove(attacker_idx)
+                break
+
+    _remember_assignment(assignment)
+    return assignment
 
 
 def _build_cma_enhanced_utility(
