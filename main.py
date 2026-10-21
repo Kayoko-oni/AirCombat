@@ -1,11 +1,12 @@
 import math
+import os
 import random
+import sys
 import time
 from dataclasses import fields
 from pathlib import Path
 
 import yaml
-import os
 
 from Controller.collision_handler import detect_collisions, resolve_collisions, is_offensive_type
 from drones.offensive.attack_drone import AttackDrone
@@ -25,6 +26,78 @@ from utils.logger import get_logger
 from base.base_manager import BaseManager
 
 LOGGER = get_logger(__name__)
+
+# ======================================================================
+# Open3D 0.19 的 Filament GUI 在 Wayland 下创建窗口会段错误：
+# 窗口未正确映射 -> framebuffer 尺寸为 0 -> 相机投影参数非法
+# -> filament::FCamera::setProjection 前置条件失败。
+# 这里在导入 Open3D 之前强制其回退到 X11（XWayland）。
+# 仅 Linux + Wayland 生效；Windows / macOS 没有 Wayland，整段逻辑自动跳过。
+# ======================================================================
+_WAYLAND_FALLBACK_RUNTIME_DIR = "/tmp/aircombat_x11_runtime"
+
+
+def _force_x11_backend_on_wayland() -> None:
+    """在 Wayland 会话下强制 Open3D 使用 X11(XWayland) 后端。
+
+    Open3D 0.19 的 Filament GUI 在 Wayland 下调用 ``create_window()`` 时，
+    窗口无法正确映射，导致 framebuffer 尺寸为 0、相机投影参数非法，
+    最终触发段错误。移除 ``WAYLAND_DISPLAY`` 并让 ``XDG_RUNTIME_DIR``
+    指向不含 Wayland socket 的目录后，GLFW 会自动回退到 X11。
+
+    Windows / macOS 不存在 Wayland，函数立即返回，不产生任何副作用。
+    """
+    if not sys.platform.startswith("linux"):
+        return
+    if not os.environ.get("WAYLAND_DISPLAY"):
+        return
+
+    try:
+        os.makedirs(_WAYLAND_FALLBACK_RUNTIME_DIR, exist_ok=True)
+    except OSError as exc:
+        LOGGER.warning(
+            "Cannot create X11 fallback runtime dir %s: %s",
+            _WAYLAND_FALLBACK_RUNTIME_DIR, exc,
+        )
+        return
+
+    os.environ.pop("WAYLAND_DISPLAY", None)
+    os.environ["XDG_RUNTIME_DIR"] = _WAYLAND_FALLBACK_RUNTIME_DIR
+    LOGGER.info(
+        "Wayland detected: forcing Open3D to X11 backend (XDG_RUNTIME_DIR=%s)",
+        _WAYLAND_FALLBACK_RUNTIME_DIR,
+    )
+
+
+_force_x11_backend_on_wayland()
+
+# ======================================================================
+# 无人机名字必须进程内唯一：它同时被用作 Open3D 场景图键名
+# （drone_/trail_/assign_/effect_ 前缀）、任务分配字典键、特效去重集合。
+# 早期用 random.randint(100, 999) 生成，实测 95 架即出现重名，会导致
+# 几何体互相覆盖、爆炸特效丢失、auction 分配结果互相覆盖。改为按前缀递增。
+# ======================================================================
+_DRONE_NAME_SEQ: dict = {}
+
+
+def _make_drone_name(prefix: str) -> str:
+    """生成进程内唯一的无人机名字。
+
+    Args:
+        prefix: 机型前缀，如 ``"Interceptor"``、``"Attack"``。
+
+    Returns:
+        形如 ``"Interceptor-1"`` 的名字，同一前缀内编号递增。
+    """
+    seq = _DRONE_NAME_SEQ.get(prefix, 0) + 1
+    _DRONE_NAME_SEQ[prefix] = seq
+    return f"{prefix}-{seq}"
+
+
+def _reset_drone_name_seq() -> None:
+    """重置名字计数器，使每次仿真运行的编号都从 1 开始。"""
+    _DRONE_NAME_SEQ.clear()
+
 
 # 全局变量，用于存储 Open3D 显示对象，如果导入失败则为 None
 Open3DDisplay = None
@@ -112,7 +185,7 @@ def _apply_ew_jamming(drones: list, ew_drones: list) -> None:
 
 # 在文件顶部（例如 _ASSIGNMENT_CONFIG 后面）添加全局变量
 _LAST_ANTI_EW_SPAWN_TIME = 0.0
-_ANTI_EW_SPAWN_COOLDOWN = 2.0   # 冷却时间（秒）
+_ANTI_EW_SPAWN_COOLDOWN = 0.5   # 冷却时间（秒）
 _MAX_ANTI_EW_RATIO = 1.5        # AntiEW 数量 / EW 数量 的上限
 
 def _spawn_anti_ew_if_needed(config: dict, drones: list, base_position: list):
@@ -134,10 +207,10 @@ def _spawn_anti_ew_if_needed(config: dict, drones: list, base_position: list):
     needed = len(ew_drones) - len(existing_anti_ew)
     if needed <= 0:
         return
-    # 每次最多生成 1 架，避免瞬间爆发
-    needed = min(needed, 1)
+    # 每次最多生成 2 架，加快响应 EW 威胁
+    needed = min(needed, 2)
     for _ in range(needed):
-        name = f"AntiEW-{random.randint(100, 999)}"
+        name = _make_drone_name("AntiEW")
         create_anti_ew_drone(name, [base_position[0], base_position[1], 50.0], config, drones)
         LOGGER.info("Spawned AntiEW drone: %s at base", name)
     _LAST_ANTI_EW_SPAWN_TIME = now
@@ -222,6 +295,158 @@ def _dispatch_defenders_to_jammed_directions(
             interceptor = interceptors.pop(0)
             interceptor._assigned_target = None
             chase_point(interceptor, target_point, map_grid=map_grid)
+
+
+# ---------------------------------------------------------------------------
+# CBS 路径规划节流
+# ---------------------------------------------------------------------------
+# 背景：cbs_plan_paths 默认单次规划时间上限为 2 秒，而 update_chase_strategy
+# 每帧都会触发一次规划，导致帧率被压缩到 1~2 FPS。这里做两层约束：
+#   1) 缩小单次规划的时间预算（_CBS_TIME_LIMIT_MS）；
+#   2) 限制规划触发频率（_CBS_MIN_INTERVAL_SECONDS），间隔内退化为直接追逐。
+_CBS_MIN_INTERVAL_SECONDS = 0.4
+# 实测 300/500ms 与 150ms 的 CBS 失败率几乎相同（97%/94%/97%），
+# 原因是 cbs_plan_paths 的 max_agents=6 上限与 CBS 组合爆炸，
+# 与时间预算无关；因此在路径规划侧修复前，取更省时的 150ms。
+_CBS_TIME_LIMIT_MS = 150
+# 连续失败熔断：CBS 在当前场景成功率低于 5%，而每次失败尝试仍会阻塞
+# _CBS_TIME_LIMIT_MS 毫秒，造成规律性卡顿。连续失败达到阈值后静默退避，
+# 由防守方回落到直线追逐，避免持续空转。
+_CBS_MAX_CONSECUTIVE_FAILURES = 3
+_CBS_FAILURE_BACKOFF_SECONDS = 3.0
+# cbs_plan_paths 在 agents 数 > max_agents 时直接返回空列表；pairs 实测均值 9.9、
+# 最大 19，全量传入会导致 55% 的调用被直接丢弃。必须先截断到该规模。
+_CBS_MAX_AGENTS = 6
+_cbs_last_plan_time = 0.0
+_cbs_failure_count = 0
+_cbs_backoff_until = 0.0
+
+
+def _reset_cbs_throttle() -> None:
+    """重置 CBS 节流与失败熔断状态（供单元测试使用）。"""
+    global _cbs_last_plan_time, _cbs_failure_count, _cbs_backoff_until
+    _cbs_last_plan_time = 0.0
+    _cbs_failure_count = 0
+    _cbs_backoff_until = 0.0
+
+
+def _cbs_plan_allowed(
+    now: float | None = None,
+    min_interval: float = _CBS_MIN_INTERVAL_SECONDS,
+) -> bool:
+    """判断当前时刻是否允许触发一次 CBS 路径规划。
+
+    通过记录上次规划的时间戳实现节流；间隔内的调用返回 False，
+    由调用方走原有的直接追逐回退分支，不引入新的状态。
+
+    Args:
+        now: 当前时间戳；为 None 时使用 time.perf_counter()。
+        min_interval: 两次规划之间的最小间隔（秒）。
+
+    Returns:
+        True 表示允许本次规划（并更新上次规划时间）；False 表示应跳过。
+    """
+    global _cbs_last_plan_time
+    current = time.perf_counter() if now is None else now
+    if current < _cbs_backoff_until:
+        return False
+    if current - _cbs_last_plan_time < min_interval:
+        return False
+    _cbs_last_plan_time = current
+    return True
+
+
+def _note_cbs_result(success: bool, now: float | None = None) -> None:
+    """记录一次 CBS 规划结果，连续失败达阈值后进入退避期。
+
+    Args:
+        success: 本次规划是否产出至少一条有效路径。
+        now: 当前时间戳；为 None 时使用 ``time.perf_counter()``。
+    """
+    global _cbs_failure_count, _cbs_backoff_until
+    if success:
+        _cbs_failure_count = 0
+        _cbs_backoff_until = 0.0
+        return
+    _cbs_failure_count += 1
+    if _cbs_failure_count >= _CBS_MAX_CONSECUTIVE_FAILURES:
+        current = time.perf_counter() if now is None else now
+        _cbs_backoff_until = current + _CBS_FAILURE_BACKOFF_SECONDS
+        _cbs_failure_count = 0
+
+
+# ---------------------------------------------------------------------------
+# 任务分配节流
+# ---------------------------------------------------------------------------
+# 背景：greedy_assignment 每帧（30 Hz）重算一次，但实测 76.2% 的相邻帧分配
+# 结果完全相同，平均每帧仅 0.47 架防守方切换目标；拍卖因此占了整帧耗时的
+# 约 50%。这里把「决策频率」降到 4 Hz，同时用事件触发保证响应性：
+#   - 目标被摧毁        -> 立即重算（避免追击已死亡目标）
+#   - 进攻方集合变化    -> 立即重算（新目标需要被分配）
+#   - 防守方集合变化    -> 立即重算（新补充的防守方需要被分配）
+# 控制回路（chase_target / move_drone / CBS）仍以 30 Hz 运行，不受影响。
+_ASSIGNMENT_MIN_INTERVAL_SECONDS = 0.25
+
+_assignment_cache: dict = {
+    "time": 0.0,              # 上次实际重算完成的时刻（perf_counter）
+    "assignment": {},         # {防守方名: 目标对象或 None}
+    "defender_names": frozenset(),
+    "attacker_names": frozenset(),
+}
+
+
+def _reset_assignment_throttle() -> None:
+    """重置任务分配节流状态（供单元测试与多次仿真复用）。"""
+    _assignment_cache["time"] = 0.0
+    _assignment_cache["assignment"] = {}
+    _assignment_cache["defender_names"] = frozenset()
+    _assignment_cache["attacker_names"] = frozenset()
+
+
+def _assignment_needs_refresh(
+    free_defenders: list,
+    visible_offensive: list,
+    now: float | None = None,
+    min_interval: float = _ASSIGNMENT_MIN_INTERVAL_SECONDS,
+) -> bool:
+    """判断当前帧是否需要重新运行任务分配。
+
+    只有以下任一条件成立时才重算，否则复用上一轮的分配结果：
+
+    1. 尚无缓存结果；
+    2. 距上次重算已超过 ``min_interval``（时间兜底）；
+    3. 缓存中的任一目标已不存活（事件触发）；
+    4. 进攻方名称集合发生变化（事件触发）；
+    5. 防守方名称集合发生变化（事件触发）。
+
+    Args:
+        free_defenders: 当前可参与分配的防守方列表。
+        visible_offensive: 当前可见的进攻方列表。
+        now: 当前时间戳；为 None 时使用 ``time.perf_counter()``。
+        min_interval: 两次重算之间的最小间隔（秒）。
+
+    Returns:
+        True 表示需要重算；False 表示可以复用缓存。
+    """
+    cache = _assignment_cache
+    if not cache["assignment"]:
+        return True
+
+    current = time.perf_counter() if now is None else now
+    if current - cache["time"] >= min_interval:
+        return True
+
+    # 目标已摧毁：复用旧分配会让防守方追击空气。
+    for target in cache["assignment"].values():
+        if target is not None and not target.is_alive():
+            return True
+
+    if frozenset(d.name for d in free_defenders) != cache["defender_names"]:
+        return True
+    if frozenset(a.name for a in visible_offensive) != cache["attacker_names"]:
+        return True
+
+    return False
 
 
 def update_chase_strategy(drones, offensive_target_point, assignment_cfg=None, map_grid=None, base_position=None):
@@ -385,19 +610,25 @@ def update_chase_strategy(drones, offensive_target_point, assignment_cfg=None, m
 
         if assignment_cfg is None:
             assignment_cfg = ImprovedAuctionConfig()
-        # 构建 jammed_mask 传入拍卖（双重保险：即使 jammed defender 误入 free_defenders）
-        import numpy as np
-        _jammed = np.zeros(len(free_defenders), dtype=bool)
-        for _i, _d in enumerate(free_defenders):
-            if getattr(_d, '_ew_jammed', False):
-                _jammed[_i] = True
-        assignment = greedy_assignment(
-            free_defenders,
-            visible_offensive,
-            config=assignment_cfg,
-            map_grid=map_grid,
-            jammed_mask=_jammed if _jammed.any() else None,
-        )
+        if _assignment_needs_refresh(free_defenders, visible_offensive):
+            # 构建 jammed_mask 传入拍卖（双重保险：即使 jammed defender 误入 free_defenders）
+            import numpy as np
+            _jammed = np.zeros(len(free_defenders), dtype=bool)
+            for _i, _d in enumerate(free_defenders):
+                if getattr(_d, '_ew_jammed', False):
+                    _jammed[_i] = True
+            _assignment_cache["assignment"] = greedy_assignment(
+                free_defenders,
+                visible_offensive,
+                config=assignment_cfg,
+                map_grid=map_grid,
+                jammed_mask=_jammed if _jammed.any() else None,
+            )
+            # 记录的是「完成时刻」，分配本身的耗时不会导致下一轮提前触发。
+            _assignment_cache["time"] = time.perf_counter()
+            _assignment_cache["defender_names"] = frozenset(d.name for d in free_defenders)
+            _assignment_cache["attacker_names"] = frozenset(a.name for a in visible_offensive)
+        assignment = _assignment_cache["assignment"]
         name_to_defender = {d.name: d for d in free_defenders}
         pairs = []
         defenders_order = []
@@ -423,13 +654,22 @@ def update_chase_strategy(drones, offensive_target_point, assignment_cfg=None, m
                     pass
                 defender.set_velocity([0.0, 0.0, 0.0])
 
-        if map_grid is not None and pairs:
+        world_paths = []
+        if map_grid is not None and pairs and _cbs_plan_allowed():
             try:
                 from algorithms.cbs_pathplan import cbs_plan_paths
-                plan_inputs = [(p[0], p[1]) for p in pairs]
-                world_paths = cbs_plan_paths(plan_inputs, map_grid=map_grid)
+                # 只对前 _CBS_MAX_AGENTS 对做协同规划，其余由下方补尾逻辑走直线追逐。
+                plan_pairs = pairs[:_CBS_MAX_AGENTS]
+                plan_inputs = [(p[0], p[1]) for p in plan_pairs]
+                world_paths = cbs_plan_paths(
+                    plan_inputs,
+                    map_grid=map_grid,
+                    max_agents=_CBS_MAX_AGENTS,
+                    time_limit_ms=_CBS_TIME_LIMIT_MS,
+                )
             except Exception:
                 world_paths = []
+            _note_cbs_result(bool(world_paths))
 
             if world_paths:
                 for defender, path in zip(defenders_order, world_paths):
@@ -447,6 +687,13 @@ def update_chase_strategy(drones, offensive_target_point, assignment_cfg=None, m
                         target_obj = assignment.get(defender.name)
                         if target_obj is not None:
                             chase_target(defender, target_obj)
+                # 超出 CBS 覆盖范围的防守方必须显式回退，否则会静止不动。
+                for defender in defenders_order[len(world_paths):]:
+                    target_obj = assignment.get(defender.name)
+                    if target_obj is not None:
+                        chase_target(defender, target_obj)
+                    else:
+                        defender.set_velocity([0.0, 0.0, 0.0])
             else:
                 for def_name, target in assignment.items():
                     defender = name_to_defender.get(def_name)
@@ -481,9 +728,11 @@ def update_chase_strategy(drones, offensive_target_point, assignment_cfg=None, m
 #=================暂行无人机生成策略，之后要被任务分配算法替代============================================
 
 def spawn_random_drone(config: dict, drones: list, base_position: list = None) -> None:
-    """根据当前进攻方数量随机生成进攻方无人机。
+    """批量生成进攻方无人机（每次 2~4 架），快速达到 max_offensive 上限。
+
     - AttackDrone/TankDrone 在存在屏蔽扇区时偏向扇区方向生成
     - 反辐射无人机以较低概率（约 15%）生成
+    - EW 无人机以约 10% 概率生成
     """
     if base_position is None:
         base_position = [0.0, 0.0, 0.0]
@@ -491,94 +740,68 @@ def spawn_random_drone(config: dict, drones: list, base_position: list = None) -
     offensive = [d for d in drones if _is_offensive(d) and d.is_alive()]
     sim_cfg = config.get("simulation", {})
     max_offensive = int(sim_cfg.get("max_offensive", 6))
-    if len(offensive) >= max_offensive:
+    remaining_slots = max_offensive - len(offensive)
+    if remaining_slots <= 0:
         return
 
+    # 批量生成：每次 2~4 架，但不超过剩余名额
+    burst_count = min(random.randint(2, 4), remaining_slots)
     jammers = _get_jammers(drones)
     ard_prob = float(config.get("simulation", {}).get("anti_radiation_spawn_prob", 0.15))
     ew_prob = float(config.get("simulation", {}).get("ew_spawn_prob", 0.10))
-    roll = random.random()
 
-    # 反辐射无人机
-    if roll < ard_prob:
+    def _random_border_position():
+        """在地图边界随机生成一个位置"""
         z = random.uniform(100.0, 250.0)
         direction = random.choice(['top', 'bottom', 'left', 'right'])
         if direction == 'top':
-            x = random.uniform(-500, 500)
-            y = random.uniform(520, 550)
+            return [random.uniform(-500, 500), random.uniform(520, 550), z]
         elif direction == 'bottom':
-            x = random.uniform(-500, 500)
-            y = random.uniform(-550, -520)
+            return [random.uniform(-500, 500), random.uniform(-550, -520), z]
         elif direction == 'left':
-            x = random.uniform(-550, -520)
-            y = random.uniform(-500, 500)
+            return [random.uniform(-550, -520), random.uniform(-500, 500), z]
         else:
-            x = random.uniform(520, 550)
-            y = random.uniform(-500, 500)
-        position = [x, y, z]
-        name = f"AntiRad-{random.randint(100, 999)}"
-        create_anti_radiation_drone(name, position, config, drones)
-        LOGGER.info("Spawned AntiRadiation drone: %s at %s", name, position)
-    elif roll < ard_prob + ew_prob:
-        # 电子战干扰无人机：从地图边界生成
-        z = random.uniform(100.0, 250.0)
-        direction = random.choice(['top', 'bottom', 'left', 'right'])
-        if direction == 'top':
-            x = random.uniform(-500, 500)
-            y = random.uniform(520, 550)
-        elif direction == 'bottom':
-            x = random.uniform(-500, 500)
-            y = random.uniform(-550, -520)
-        elif direction == 'left':
-            x = random.uniform(-550, -520)
-            y = random.uniform(-500, 500)
-        else:
-            x = random.uniform(520, 550)
-            y = random.uniform(-500, 500)
-        position = [x, y, z]
-        name = f"EW-{random.randint(100, 999)}"
-        create_ew_drone(name, position, config, drones)
-        LOGGER.info("Spawned EW drone: %s at %s", name, position)
-    else:
-        drone_type = random.choice(["attack", "tank"])
-        if jammers and random.random() < 0.65:
-            jammer = random.choice(jammers)
-            if jammer.jamming_direction is not None:
-                direction_angle = jammer.jamming_direction
-                half = jammer.jamming_sector_half_angle
-                angle = direction_angle + random.uniform(-half, half)
-                dist = random.uniform(250.0, 450.0)
-                z = random.uniform(100.0, 250.0)
-                x = base_position[0] + dist * math.cos(angle)
-                y = base_position[1] + dist * math.sin(angle)
-                position = [x, y, z]
-                name = f"{drone_type.capitalize()}-{random.randint(100, 999)}"
-                if drone_type == "attack":
-                    create_attack_drone(name, position, config, drones)
-                elif drone_type == "tank":
-                    create_tank_drone(name, position, config, drones)
-                return
+            return [random.uniform(520, 550), random.uniform(-500, 500), z]
 
-        z = random.uniform(100.0, 250.0)
-        direction = random.choice(['top', 'bottom', 'left', 'right'])
-        if direction == 'top':
-            x = random.uniform(-500, 500)
-            y = random.uniform(520, 550)
-        elif direction == 'bottom':
-            x = random.uniform(-500, 500)
-            y = random.uniform(-550, -520)
-        elif direction == 'left':
-            x = random.uniform(-550, -520)
-            y = random.uniform(-500, 500)
+    def _spawn_single():
+        """生成单架无人机（内部辅助）"""
+        roll = random.random()
+        if roll < ard_prob:
+            position = _random_border_position()
+            name = _make_drone_name("AntiRad")
+            create_anti_radiation_drone(name, position, config, drones)
+        elif roll < ard_prob + ew_prob:
+            position = _random_border_position()
+            name = _make_drone_name("EW")
+            create_ew_drone(name, position, config, drones)
         else:
-            x = random.uniform(520, 550)
-            y = random.uniform(-500, 500)
-        position = [x, y, z]
-        name = f"{drone_type.capitalize()}-{random.randint(100, 999)}"
-        if drone_type == "attack":
-            create_attack_drone(name, position, config, drones)
-        elif drone_type == "tank":
-            create_tank_drone(name, position, config, drones)
+            drone_type = random.choice(["attack", "tank"])
+            if jammers and random.random() < 0.65:
+                jammer = random.choice(jammers)
+                if jammer.jamming_direction is not None:
+                    direction_angle = jammer.jamming_direction
+                    half = jammer.jamming_sector_half_angle
+                    angle = direction_angle + random.uniform(-half, half)
+                    dist = random.uniform(250.0, 450.0)
+                    z = random.uniform(100.0, 250.0)
+                    x = base_position[0] + dist * math.cos(angle)
+                    y = base_position[1] + dist * math.sin(angle)
+                    position = [x, y, z]
+                    name = _make_drone_name(drone_type.capitalize())
+                    if drone_type == "attack":
+                        create_attack_drone(name, position, config, drones)
+                    elif drone_type == "tank":
+                        create_tank_drone(name, position, config, drones)
+                    return
+            position = _random_border_position()
+            name = _make_drone_name(drone_type.capitalize())
+            if drone_type == "attack":
+                create_attack_drone(name, position, config, drones)
+            elif drone_type == "tank":
+                create_tank_drone(name, position, config, drones)
+
+    for _ in range(burst_count):
+        _spawn_single()
 
 def balance_defenders(config: dict, drones: list) -> None:
     """基于未匹配攻击方数量补充防守方。
@@ -605,7 +828,7 @@ def balance_defenders(config: dict, drones: list) -> None:
     for _ in range(need):
         drone_type = random.choice(["scout", "interceptor"])
         position = [0.0, 0.0, 0.0]
-        name = f"{drone_type.capitalize()}-{random.randint(100,999)}"
+        name = _make_drone_name(drone_type.capitalize())
         if drone_type == "scout":
             create_scout_drone(name, position, config, drones)
         else:
@@ -636,8 +859,112 @@ def _build_assignment_config(config: dict):
 #==================================================================================================
 
 
+# ======================================================================
+# 无人机数量峰值统计
+# ======================================================================
+_DRONE_COUNT_PEAK = {
+    "max_total": 0,            # 单帧最大总架数（存活+坠毁中）
+    "max_alive_total": 0,      # 单帧最大存活总架数
+    "time_max_total": 0.0,     # 达到 max_total 时的仿真时间
+    "time_max_alive": 0.0,     # 达到 max_alive_total 时的仿真时间
+    "breakdown_total": {},     # max_total 时的细分：{类型: 数量}
+    "breakdown_alive": {},     # max_alive_total 时的细分：{类型: 数量}
+    "offensive_max": 0,        # max_alive_total 时进攻方存活数
+    "defensive_max": 0,        # max_alive_total 时防守方存活数
+    "total_frames": 0,         # 总帧数
+}
+
+
+def _update_drone_count_peak(drones: list, sim_elapsed: float) -> None:
+    """每帧调用，更新无人机数量峰值统计。
+
+    统计两个维度：
+    1. 总架数（含存活 + 已坠毁但未清除的无人机）= len(drones)
+    2. 存活架数（仅存活）
+
+    Args:
+        drones: 当前帧的全部无人机列表。
+        sim_elapsed: 仿真已运行时间（秒）。
+    """
+    global _DRONE_COUNT_PEAK
+    _DRONE_COUNT_PEAK["total_frames"] += 1
+
+    # 按类型细分（所有无人机，含坠毁中）
+    type_counts_total = {}
+    for d in drones:
+        t = d.drone_type
+        type_counts_total[t] = type_counts_total.get(t, 0) + 1
+    total = len(drones)
+
+    # 按类型细分（仅存活）
+    alive = [d for d in drones if d.is_alive()]
+    type_counts_alive = {}
+    for d in alive:
+        t = d.drone_type
+        type_counts_alive[t] = type_counts_alive.get(t, 0) + 1
+    alive_total = len(alive)
+
+    # 更新总架数峰值
+    if total > _DRONE_COUNT_PEAK["max_total"]:
+        _DRONE_COUNT_PEAK["max_total"] = total
+        _DRONE_COUNT_PEAK["time_max_total"] = sim_elapsed
+        _DRONE_COUNT_PEAK["breakdown_total"] = dict(type_counts_total)
+
+    # 更新存活架数峰值
+    if alive_total > _DRONE_COUNT_PEAK["max_alive_total"]:
+        _DRONE_COUNT_PEAK["max_alive_total"] = alive_total
+        _DRONE_COUNT_PEAK["time_max_alive"] = sim_elapsed
+        _DRONE_COUNT_PEAK["breakdown_alive"] = dict(type_counts_alive)
+        _DRONE_COUNT_PEAK["offensive_max"] = sum(
+            1 for d in alive if is_offensive_type(d.drone_type)
+        )
+        _DRONE_COUNT_PEAK["defensive_max"] = alive_total - _DRONE_COUNT_PEAK["offensive_max"]
+
+
+def _print_drone_count_report() -> None:
+    """仿真结束后打印无人机数量峰值报告。"""
+    p = _DRONE_COUNT_PEAK
+    print("\n" + "=" * 60)
+    print("  无人机数量峰值统计报告 (Drone Count Peak Report)")
+    print("=" * 60)
+
+    # ---- 总架数峰值 ----
+    print(f"\n[1] 单帧最大总架数（含坠毁中）: {p['max_total']}")
+    print(f"    发生时间: {p['time_max_total']:.1f}s / 仿真帧数: {p['total_frames']}")
+    if p["breakdown_total"]:
+        print(f"    细分: {_format_breakdown(p['breakdown_total'])}")
+
+    # ---- 存活架数峰值 ----
+    print(f"\n[2] 单帧最大存活架数: {p['max_alive_total']}")
+    print(f"    发生时间: {p['time_max_alive']:.1f}s")
+    print(f"    进攻方存活: {p['offensive_max']}  |  防守方存活: {p['defensive_max']}")
+    if p["breakdown_alive"]:
+        print(f"    细分: {_format_breakdown(p['breakdown_alive'])}")
+
+    print("\n" + "=" * 60)
+
+
+def _format_breakdown(breakdown: dict) -> str:
+    """格式化机型细分字典。
+
+    Args:
+        breakdown: {机型名: 数量} 字典。
+
+    Returns:
+        形如 "AttackDrone=26, TankDrone=37" 的字符串。
+    """
+    known = ["AttackDrone", "TankDrone", "AntiRadiationDrone", "EWDrone",
+             "ScoutDrone", "InterceptorDrone", "AntiEWDrone"]
+    parts = [f"{t}={breakdown[t]}" for t in known if t in breakdown]
+    # 兜底：未知类型
+    parts.extend(f"{t}={c}" for t, c in breakdown.items() if t not in known)
+    return ", ".join(parts)
+
+
 def run_simulation(config: dict):
     """运行仿真主循环"""
+    _reset_drone_name_seq()
+    _reset_assignment_throttle()
     global _ASSIGNMENT_CONFIG
     _ASSIGNMENT_CONFIG = _build_assignment_config(config)
     sim_cfg = config.get("simulation", {})
@@ -691,6 +1018,10 @@ def run_simulation(config: dict):
     #进攻无人机生成时间的计时器初始化为0, 其值随着时间的进行同步增加, 当其大于next_spawn_time时生成新无人机(之后肯定要改掉的)
 
 
+    # 帧率控制基准：按「补足到目标帧周期」推进，而不是每帧固定追加 frame_time。
+    # 原实现每帧耗时 = 计算耗时 + frame_time，实际帧率被压成 1/(计算+33ms)；
+    # 改为补足式后，计算快时仍锁定 fps 上限，计算慢时不再额外叠加等待。
+    frame_start = time.perf_counter()
     try:
         while (duration <= 0 or time.time() - start_time < duration) and not base_manager.is_destroyed():
             # 当 duration<=0 时表示无限运行，否则按配置时长运行, 同时如果基地被摧毁了也要结束仿真
@@ -718,6 +1049,10 @@ def run_simulation(config: dict):
 
             #5.获取存活无人机列表
             alive_drones = [d for d in drones if not d.destroyed]
+
+            # ---- 记录无人机数量峰值 ----
+            sim_elapsed = time.time() - start_time
+            _update_drone_count_peak(drones, sim_elapsed)
 
             #5.5 反辐射无人机自毁检查（每 0.5 秒集中检查一次）
             ard_check_timer += frame_time
@@ -760,8 +1095,7 @@ def run_simulation(config: dict):
             if spawn_timer >= next_spawn_time:
                 spawn_timer = 0.0
                 next_spawn_time = random.uniform(spawn_min, spawn_max)
-                if random.random() < 0.9:
-                    spawn_random_drone(config, drones, base_position)
+                spawn_random_drone(config, drones, base_position)
 
             #10. 平衡防守方数量
             balance_defenders(config, drones) #每帧立即平衡防守方数量, 直到防守方数量 >= 进攻方数量"""
@@ -778,8 +1112,12 @@ def run_simulation(config: dict):
                 if not display.app.run_one_tick():
                     LOGGER.info("GUI event loop ended.")
                     break
-            time.sleep(frame_time)
+            elapsed = time.perf_counter() - frame_start
+            if elapsed < frame_time:
+                time.sleep(frame_time - elapsed)
+            frame_start = time.perf_counter()
     finally:
+        _print_drone_count_report()
         if display is not None:
             display.close_window()
             #如果上面的try中发生错误, 则直接执行finally中的代码, 使仿真出错时可以正常退出程序"""

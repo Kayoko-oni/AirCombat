@@ -370,6 +370,10 @@ class Open3DDisplay:
         """Add dynamic geometry defensively to avoid GUI crashes from invalid shapes."""
         if geometry is None:
             return False
+        # 同名几何体重复添加时 Open3D 只打 WARNING 但不抛异常，
+        # 会让 dynamic_geometries 与实际场景图不一致，这里显式拦截。
+        if self.scene_widget.scene.has_geometry(name):
+            return False
         try:
             self.scene_widget.scene.add_geometry(name, geometry, material)
             self.dynamic_geometries.add(name)

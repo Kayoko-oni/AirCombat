@@ -257,6 +257,9 @@ class ImprovedAuctionSolver:
     ) -> int:
         n = utility.shape[0]
         iterations = 0
+        # utility 在本方法内只读，因此各行的均值在整个 phase 中是常量。
+        # 提前算一次，避免内层循环每轮重复调用 np.mean。
+        row_means = utility.mean(axis=1)
 
         for _ in range(self.config.max_iterations_per_phase):
             # 仅让当前未分配的智能体重新出价。
@@ -276,9 +279,8 @@ class ImprovedAuctionSolver:
                     # 用 partition 找次大值，通常比完整排序更快。
                     second_best_value = float(np.partition(net_values, -2)[-2])
 
-                row = utility[agent_idx]
                 # regret 项会增强“明显更优”候选任务的出价强度。
-                regret = max(0.0, float(row[best_task] - row.mean()))
+                regret = max(0.0, float(utility[agent_idx, best_task] - row_means[agent_idx]))
                 bid_increment = (best_value - second_best_value) + epsilon * (
                     1.0 + self.config.regret_weight * regret
                 )

@@ -1,6 +1,9 @@
 import open3d as o3d
 import numpy as np
 
+# 轨迹去重阈值（米）：相邻点距离小于该值视为重复点。
+_PATH_DUP_EPS = 1e-6
+
 
 def create_drone_mesh(position, color=(1.0, 0.0, 0.0)):
     sphere = o3d.geometry.TriangleMesh.create_sphere(radius=3.0)
@@ -76,26 +79,27 @@ def create_path_line(points, color=(1.0, 0.0, 0.0)):
         return None
 
     # Remove consecutive duplicates to avoid zero-length segments.
-    filtered = [pts[0]]
-    for point in pts[1:]:
-        if np.linalg.norm(point - filtered[-1]) > 1e-6:
-            filtered.append(point)
-    if len(filtered) < 2:
+    # 用向量化差分替代逐点 np.linalg.norm：轨迹点数多时，原实现每帧要执行
+    # 数万次标量调用，是渲染侧最热的 Python 开销之一。
+    if len(pts) > 1:
+        steps = np.linalg.norm(np.diff(pts, axis=0), axis=1)
+        keep = np.empty(len(pts), dtype=bool)
+        keep[0] = True
+        keep[1:] = steps > _PATH_DUP_EPS
+        pts = pts[keep]
+    if len(pts) < 2:
         return None
 
-    lines = [[i, i + 1] for i in range(len(filtered) - 1)]
-    if not lines:
-        return None
-
+    total = len(pts) - 1
+    segment_index = np.arange(total, dtype=np.int32)
+    lines = np.column_stack([segment_index, segment_index + 1])
     line_set = o3d.geometry.LineSet(
-        points=o3d.utility.Vector3dVector(np.asarray(filtered)),
+        points=o3d.utility.Vector3dVector(pts),
         lines=o3d.utility.Vector2iVector(lines),
     )
-    total = len(lines)
-    colors = []
-    for index in range(total):
-        fade = 0.3 + 0.7 * ((index + 1) / total)
-        colors.append([min(1.0, c * fade) for c in color])
+    # 按线段序号做渐隐，向量化计算。
+    fades = 0.3 + 0.7 * (np.arange(1, total + 1, dtype=float) / total)
+    colors = np.minimum(1.0, np.asarray(color, dtype=float)[None, :] * fades[:, None])
     line_set.colors = o3d.utility.Vector3dVector(colors)
     return line_set
 

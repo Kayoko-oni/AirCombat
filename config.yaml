@@ -11,7 +11,7 @@ map:
     max_attempts_per_building: 2000
   # TODO: 添加边界定义和障碍物
 base:
-  health: 100
+  health: 500.0
   position: [-10, -25, 0]
   collision_radius: 12.5
 
@@ -23,8 +23,8 @@ simulation:
 
   # 生成新进攻无人机的时间间隔（秒），仿真可通过调大这两个值实现小规模测试
   # 为了默认方便调试，默认间隔设置为较大值，减少场景密度
-  spawn_interval_min: 1
-  spawn_interval_max: 2
+  spawn_interval_min: 0.2
+  spawn_interval_max: 0.5
   # 最大同时存在的进攻方数量（用于限制自动生成）
   max_offensive: 50
   # 进攻方初始化高度分布（低空+高空）
@@ -107,23 +107,38 @@ drones:
     max_speed: 30.0
     health: 80.0
     attack_power: 25.0
-    battery: 80.0
+    battery: 240.0
   tank:
     speed: 4.5
     max_speed: 20.0
     health: 150.0
     attack_power: 15.0
-    battery: 120.0
+    battery: 360.0
   scout:
     speed: 15.0
     max_speed: 40.0
     health: 60.0
     attack_power: 5.0
-    battery: 60.0
+    battery: 180.0
   interceptor:
     speed: 12.0
     max_speed: 35.0
     health: 90.0
     attack_power: 20.0
-    battery: 90.0
+    battery: 270.0
+  anti_radiation:
+    battery: 270.0
+    speed: 10.0
+    health: 45.0
+    attack_power: 0.0
+  ew:
+    battery: 300.0
+    speed: 8.0
+    health: 40.0
+    attack_power: 15.0
+  anti_ew:
+    battery: 180.0
+    speed: 15.0
+    health: 60.0
+    attack_power: 5.0
 
