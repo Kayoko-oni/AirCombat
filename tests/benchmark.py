@@ -774,7 +774,8 @@ def run_evaluation(
 
     output_path = Path(output).resolve() if output else (
         PROJECT_ROOT
-        / "remark"
+        / "tests"
+        / "reports"
         / f"eval_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
     )
 
@@ -835,7 +836,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         "--output",
         type=str,
         default="",
-        help="Optional output JSON path. Defaults to remark/eval_report_<timestamp>.json",
+        help="Optional output JSON path. Defaults to tests/reports/eval_report_<timestamp>.json",
     )
     parser.add_argument(
         "--cbs-eval-max-agents",
