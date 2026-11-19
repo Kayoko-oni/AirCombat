@@ -94,15 +94,18 @@ pip install -r requirements.txt
 python main.py
 ```
 
-如果 Open3D 可视化可用，会打开一个窗口显示无人机实时位置；否则以无界面模式运行，只输出日志。
-
-还没怎么加接口，不太清楚具体怎么处理，后面加。
+如果 Open3D 可视化可用，会打开一个窗口显示无人机实时位置；若加载了
+`Data/maps/*.obj` 城市模型会先做体素化，启动会慢几秒。未安装 open3d 或窗口初始化
+失败时会自动退化为无界面模式，只输出日志。
 
 ### 控制说明
 
 - 鼠标拖拽：旋转视角
 - 鼠标滚轮：缩放
-- 右键点击：重置视角
+- 右键单击：重置视角
+- `R`：重置视角（键盘）
+- `P`：暂停 / 继续仿真
+- 终端按键 `r`：清空所有路径缓存并立即重规划
 
 ### 4. 配置调整
 
@@ -203,10 +206,11 @@ AirCombat 采用模块化设计，各模块职责清晰分离：
   - 方法：位置更新、速度设置、伤害处理、存活检查
 
 - **具体机型**（继承自 BaseDrone）：
-  - `AttackDrone`: 高速攻击机 (速度7.5, 攻击力25, 血量80)
-  - `TankDrone`: 高血量肉盾机 (速度4.5, 攻击力15, 血量150)
-  - `ScoutDrone`: 超高速侦察机 (速度15.0, 攻击力5, 血量60)
-  - `InterceptorDrone`: 中等拦截机 (速度12.0, 攻击力20, 血量90)
+  - `AttackDrone`: 高速攻击机 (speed 8.0, max_speed 32.0, 攻击力25, 血量80)
+  - `TankDrone`: 高血量肉盾机 (speed 4.8, max_speed 22.0, 攻击力15, 血量150)
+  - `ScoutDrone`: 超高速侦察机 (speed 15.0, max_speed 40.0, 攻击力5, 血量60)
+  - `InterceptorDrone`: 中等拦截机 (speed 12.0, max_speed 35.0, 攻击力20, 血量90)
+  - `EWDrone`: 电子战机 max_speed 32.0；`AntiRadiationDrone`: max_speed 32.0
 
 #### 3. 控制系统 (`Controller/`)
 - **`single_control.py`**: 单机运动控制
@@ -233,13 +237,12 @@ AirCombat 采用模块化设计，各模块职责清晰分离：
   - 路径线段生成
 
 #### 6. 算法模块 (`algorithms/`)
-- **`auction_assign.py`**: 任务分配算法框架
-  - 简单的循环分配（占位符）
-  - 为后续拍卖算法预留接口
+- **`auction_assign.py`**: 改进拍卖 + CMA 动态任务分配（参数见 `config.assignment`）
 
-- **`cbs_pathplan.py`**: 路径规划算法框架
-  - 基础路径生成（占位符）
-  - 为 CBS 算法预留接口
+- **`cbs_pathplan.py`**: 基于网格的 CBS
+  - 顶点冲突 + 交换（边）冲突，低层 A* 在 `(格子, 时刻)` 上搜索
+  - 约束树 + 闭集；超时返回无冲突子集；同格起点/终点自动错开
+  - 单机 `a_star_plan_world` / `line_of_sight_world` 供 PathTracker 使用
 
 #### 7. 数据存储 (`data/`)
 - **`maps/base_map.json`**: 地图配置
@@ -329,7 +332,8 @@ drones:        # 四种机型详细配置
 def a_star_plan_world(start, goal, map_grid, max_time_ms=50) -> List[Tuple]
 ```
 
-- 八连通邻居（含对角），欧氏距离启发
+- 八连通邻居（含对角），对角代价 1，加权 Chebyshev 启发（`_H_WEIGHT=1.5`，改 1.0 即严格 A*），禁止切角穿墙
+- 无约束时走轻量格子 A*；同代价时优先扩展更深节点并偏好直线
 - 超时保护，返回世界坐标路径（已平滑）
 
 #### 2.2 视线检测
@@ -338,16 +342,28 @@ def a_star_plan_world(start, goal, map_grid, max_time_ms=50) -> List[Tuple]
 def line_of_sight_world(start, goal, map_grid) -> bool
 ```
 
-- Bresenham 直线算法，判断 XY 平面是否被建筑阻挡
+- Bresenham 直线算法，判断 XY 平面是否被建筑阻挡；与 A* 一样检查对角切角
 
 #### 2.3 CBS 多机规划
 
 ```python
-def cbs_plan_paths(agent_pairs, map_grid, time_limit_ms=200, max_agents=8) -> List[List]
+def cbs_plan_paths(agent_pairs, map_grid, max_agents=6, time_limit_ms=200) -> List[List]
+def cbs_plan_schedules(agent_pairs, map_grid, max_agents=6, time_limit_ms=200,
+                       tick_seconds=0.5) -> List[tuple]
 ```
 
 - 输入：`[(start, goal), ...]` 或 `[(drone_obj, goal), ...]`
-- 仅规划 XY 二维（Z 不变），点冲突检测，返回无冲突路径集
+- 低层 A* 在 `(格子, 时刻)` 上搜索，支持顶点约束与交换（边）约束；时间 = 步数，
+  因此必须按计划速度执行才能保持无冲突
+- 高层 CBS 带约束树与闭集，超时返回无冲突子集而不是整批放弃
+- `cbs_plan_paths` 返回平滑后的几何折线（可视化/旧接口），不含时间戳
+- `cbs_plan_schedules` 返回 `(points, times)`：原始网格点（不平滑）+ `times[i] = i * tick_seconds`，
+  供 `PathFollower` 直接执行；主仿真按 `tick_seconds = map.path_cell_size / plan_speed` 传入
+- t=0 同格起点不视为冲突（同阵营伤害目前不判定）；同格起点/终点会自动错开到附近空格
+- 只规划 XY；z 取目标高度（为 0 时取起点高度）
+- 超过 `max_agents` 时只规划前 `max_agents` 架，其余返回 `[]`，由调用方退化处理
+
+回归用例见 `tools/cbs_diagnose.py`（不依赖 open3d）。
 
 ---
 
@@ -378,48 +394,105 @@ class PathTracker:
 ### 四、控制器集成 (`Controller/single_control.py`)
 
 ```python
-def chase_target(drone, enemies, dt, map_grid=None, tracker=None, current_time=0)
-def chase_point(drone, target_pos, dt, map_grid=None, tracker=None, current_time=0)
+def chase_target(drone, target, map_grid=None)
+def chase_point(drone, target_point, map_grid=None)
+
+class PathFollower:
+    def set_path(self, points, start_time, plan_speed=None, times=None) -> bool
+    def update(self, now) -> bool
 ```
 
-- 有 `map_grid` 时使用 `PathTracker` 实现避障
+- 有 `map_grid` 时使用 `PathTracker` 实现按需 A* 避障
 - 无地图或规划失败时退化为直线追逐
+- A* 失败/短路径时**不再返回无人机自身位置**（那会让 `chase_point` 距离≈0 而不设速度，表现为边界/楼前卡死）；
+  低空先爬升到 20 m，且爬升航点会朝目标水平前进 20 m，避免只升降不前进
+- `PathFollower` 执行 CBS 路径：优先使用 `cbs_plan_schedules` 给出的 `times`；
+  没有 `times` 时退回“累计距离 / `plan_speed`”估算
+- 水平速度按时间表给、垂直速度单独给；落后时提速、超前时减速/悬停
 
 ---
 
 ### 五、主程序集成 (`main.py`)
 
 ```python
-update_chase_strategy(drones, target_point, assignment_cfg=None, map_grid=None)
+update_chase_strategy(drones, target_point, assignment_cfg=None, map_grid=None,
+                      base_positions=None, sim_time=None, plan_speed=30.0)
 ```
 
-- 在仿真循环中传入 `display.map_grid`
-- 进攻方：目标不可直达时调用 A* 绕行
-- 防守方：调用 CBS 规划集体路径
+- 启动时创建 `Open3DDisplay`（有 OBJ 城市地图时先体素化），每帧 `display.update(...)` +
+  `app.run_one_tick()`；未装 open3d 或初始化失败自动 headless，窗口关闭时结束仿真
+- `run_simulation` 中优先复用可视化的 `display.map_grid`；无界面时由 `config.map` 生成一次
+  `MapGrid`（`map.path_cell_size`，默认 5 m），整局复用
+- `sim_time` 为仿真时间；CBS 默认每 1 个仿真秒重规划一次，`map_grid=None` 时退化回直接追逐
+- 进攻方：目标不可直达时由 PathTracker/A* 绕行
+- 防守方：`cbs_plan_schedules` 出带 tick 时间戳的轨迹，交给 `PathFollower` 逐航点推进；
+  `tick_seconds = map_grid.cell_size / plan_speed`，走完路径或路径为空时才退回直接追逐；
+  CBS 最多同时规划 10 架防守方（`max_agents=10`），其余退化直接追逐
+- 防守方目标有 **8 秒锁定**（`LOCK_TTL`）：短暂被 ARD 屏蔽、或拍卖想换目标时，仍先追原目标；
+  超过 8 秒或目标死亡后才重新分配，避免“刚靠近就换目标”
+- **近距离可见**：进攻方进入任一防守方 120 m 内视为光学/红外可见，不受 ARD 屏蔽影响；
+  这样基地附近的漏网目标仍能被拦截
+- **被 EW 干扰的防守方**不再全部原地悬停：非拦截机在离基地 350 m 内、目标进入基地 300 m 时，
+  做本地自主拦截并锁定目标，且优先选**最接近基地**的威胁；拦截机仍然优先追 EW
+- **终端防御**：进攻方进入任一基地 300 m 内时，强制最近的可用防守方转向拦截；
+  每个威胁最多保留一个已有防守方，其余防守方可以接新威胁，避免所有防守方都锁在旧目标上
+- 防守方编制按 **全部非 ARD 进攻方 × `defender_ratio`** 补充（默认 1.0），
+  新机从随机基地外围环形起飞；`defender_interceptor_ratio` 控制新机中拦截机占比（默认 0.65，更耐撞）
+- 出生点用 `MapGrid.is_occupied` 检查，环形/网格搜索都避开建筑；基地周围全被占满时退到全图空格
+- 进攻方出生点收缩到 **±460~490 m**（可视地面/规划网格 ±500 内），不再出生在边界外；
+  扇区方向生成也会夹到 ±480 内，避免“地图外某个高度卡死”；若出生点落在建筑 footprint 内，
+  会直接抬到楼顶 + 10 m
+- AntiEW 也不再固定刷在基地中心，而是从基地外围空地生成
+- 所有存活无人机最低离地 **5 m**（`simulation.min_flight_altitude`），不会完全贴地飞
+- **建筑体移动避让**：`move_drone` 每帧检查新位置是否落入建筑 footprint；若高度 < 楼顶 + 5 m，
+  阻止这一帧的水平移动，并**直接给 z 增加 20 m/s 的爬升量**（不是只改 vz，避免控制器下一帧又把
+  速度设回下降、导致贴墙上下抽）。末尾还会再检查一次当前位置，兜底碰撞分离等外部改位置的情况。
+  进攻方（PathTracker/直追）和防守方（CBS/PathFollower）都走同一个 `move_drone`，因此都会生效。
+  CBS/PathTracker 仍是 2D 规划，所以可能看到“贴楼爬升再越过”，但不会穿楼或长期卡在墙边；后续可做 2.5D 高度规划减少这种贴墙
+- 同一目标全局只保留一架防守方；碰撞后把两机推开到 8 m 之外，并给 0.8 s 免撞窗口 +
+  0.8 s 击退速度保持（期间不被 PathFollower/追击逻辑覆盖），避免贴脸反复反向抖动
+- 无限模式下基地全毁会在**同一进程/同一窗口**重置一局，不会退出后被外部重新拉起新窗口
+- 分配/CBS 策略按 `simulation.strategy_interval_s`（默认 0.12 s）降频；策略耗时会自动把间隔
+  拉长到 `3×耗时`，避免大编队掉帧。`PathFollower` 仍然每帧推进，不受降频影响
 
 **生成控制**：
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `max_offensive` | 6 | 最大进攻方数量 |
-| `spawn_interval_min` | 5.0 | 最小生成间隔（秒） |
-| `spawn_interval_max` | 12.0 | 最大生成间隔（秒） |
+| `max_offensive` | 40 | 最大进攻方数量（演示规模；压力测试可调大） |
+| `spawn_interval_min` | 0.8 | 最小生成间隔（秒） |
+| `spawn_interval_max` | 0.8 | 最大生成间隔（秒） |
+| `defender_ratio` | 1.0 | 防守方数量 ≈ 非 ARD 进攻方 × ratio |
+| `defender_interceptor_ratio` | 0.65 | 新补充防守方中拦截机占比（越高越耐撞） |
+| `battery_drain_rate` | 0.5 | 电池消耗（点/秒）；5.0 时 60 点电池只能飞 12 秒 |
 
 ---
 
-### 六、可视化增强 (`Visual/`)
+### 六、可视化 (`Visual/`)
 
-| 类型 | 颜色/样式 | 对应属性 |
-|------|----------|----------|
-| 进攻方避障路径 | 绿色 | `drone._avoid_path` |
-| 防守方 CBS 路径 | 紫色 | `drone._cbs_path` |
-| 防守方→目标连线 | 黄色虚线 | `create_dashed_line()` |
-| 历史轨迹 | 红色 | 原有轨迹线 |
+`Open3DDisplay` 负责窗口、场景、HUD 和每帧更新；`main.py` 在启动时创建，
+失败则自动退化为无界面模式。
+
+| 类型 | 颜色/样式 | 对应属性 / 开关 |
+|------|----------|----------------|
+| 防守方→目标连线 | 黄色虚线 | `_assigned_target` |
+| 历史轨迹 | 机型颜色 | `drone.trail` |
+| 坠毁/爆炸 | 球体放大 / 重力下落 | `drone.death_timer`、`impact` |
+| HUD | 双阵营数量、基地血量、FPS、操作提示、攻防对应指标 | 每帧刷新 |
+| 攻防对应行 | `Visible / Assigned / Collisions` | `main` 每帧传入 `metrics`，与算法同一套可见性判断 |
+
+- `P` 暂停/继续（只刷新窗口和特效，不推进仿真）
+- `R` 重置视角；`P` 暂停
+- CBS / A* 路径只在内部规划使用，窗口不再画紫色/绿色路径，画面保留黄色目标虚线和可选轨迹
+- `duration: 0` 时无限运行；基地全毁只在**同一进程/同一窗口内重置一局**，不会退出后由外部重新启动
+- 关闭窗口或 Ctrl+C 才结束；结束/异常时控制台会打印 `===== SIMULATION ENDED (...) =====`
+- Open3D `update` 抛 Python 异常时会自动关闭显示并切到 headless，不让窗口异常直接带走整个仿真
+- OBJ 城市地图由 `utils/obj_voxelizer.py` 体素化后同时用于渲染和 `MapGrid`
 
 **虚线工具**：
 
 ```python
-def create_dashed_line(p1, p2, color, dash_length=0.3, gap_length=0.2)
+def create_dashed_line(p1, p2, color, dash_length=8.0, gap_length=6.0)
 ```
 
 ---
@@ -428,18 +501,30 @@ def create_dashed_line(p1, p2, color, dash_length=0.3, gap_length=0.2)
 
 ```yaml
 path_planning:
-  replan_distance: 5.0
-  replan_cooldown: 0.5
-  max_plan_time_ms: 50
-  path_tolerance: 0.5
+  plan_speed: 30.0          # CBS 路径执行速度（全体防守方统一）
+  replan_distance: 1.0
+  replan_cooldown: 2.0
+  max_plan_time_ms: 30
+  path_tolerance: 1.0
   debug_log: false
 
 simulation:
-  max_offensive: 6
-  spawn_interval_min: 5.0
-  spawn_interval_max: 12.0
+  fps: 30
+  duration: 0                 # 0 = 无限运行；Ctrl+C 或关闭窗口结束
+  enable_visualization: true  # false 或无 open3d 时自动无界面运行
+  enable_trails: false        # 轨迹线每帧重建，长时间运行建议关闭以降低 Open3D 压力
+  strategy_interval_s: 0.12  # 分配/CBS 最小间隔；耗时会自动拉长，PathFollower 仍每帧推进
+  max_offensive: 40
+  spawn_interval_min: 0.8
+  spawn_interval_max: 0.8
+  defender_ratio: 1.0
+  defender_interceptor_ratio: 0.65
+  battery_drain_rate: 0.5
+  min_flight_altitude: 5.0    # 最低离地高度（米）
 
 map:
+  path_cell_size: 5.0       # 规划网格分辨率（米）
+  use_obj_model: true       # 有 Open3D 时优先用 Data/maps 的 OBJ 城市模型
   buildings:
     avoid_overlap: true
     padding: 2.5
@@ -447,10 +532,65 @@ map:
 
 ---
 
-### 八、工具脚本 (`tools/`)
+### 八、攻防对应量化 (`tools/battle_trace.py`)
+
+无界面运行，直接向控制台输出可解析的记录：
+
+| 行 | 含义 |
+|----|------|
+| `SUMMARY,t,...` | 每个策略帧：进攻方、可见进攻方、干扰机、防守方、已分配对数、配对最小距离、基地血量 |
+| `TRACE,t,...` | 每 0.5 s 跟踪**一架**防守方：位置、速度、目标、目标位置、距离、PathFollower 进度 |
+| `COLLISION` / `BASE` / `DEATH` | 跨阵营碰撞、基地掉血、死亡原因（collision / self_destruct / battery） |
+
+```bash
+# 60 秒、40 架进攻方、0.8s 生成间隔、固定随机种子
+python tools/battle_trace.py --duration 60 --max-offensive 40 --spawn 0.8 --seed 1
+
+# 跟踪指定防守方（名字从运行日志/TRACE 里拿）
+python tools/battle_trace.py --focus Scout-123 --duration 30
+```
+
+关键指标：
+
+- `coverage_defenders = avg_assigned / avg_defenders`：有对应目标的防守方比例
+- `coverage_visible = avg_assigned / avg_visible`：大于 1 说明锁定目标在屏蔽中仍被追击
+- `pair_dist_min`：任一“防守方-目标”对的最小距离；进入 8 m 才触发碰撞
+- `collisions / base_hits / base_health`：拦截次数、漏网次数、基地存活
+- `target_switches`：目标切换次数，用来衡量锁定/重分配稳定性
+- `death_causes`：区分被拦截、自毁、电池耗尽
+
+一次 **60 秒**、40 架进攻方、0.8 s 间隔、65% 拦截机的实测（`battle_bench.py`，seed 1~3，
+**已修复进攻方卡在边界/楼前的问题**）：
+
+| seed | collisions | base_health | avg_assigned | pair_dist_min | target_switches | 攻/防死亡 | 最终攻/防 |
+|------|-----------|-------------|--------------|---------------|-----------------|-----------|-----------|
+| 1 | 70 | 130/300 | 10.08 | 8.1 m | 152 | 34 / 30 | 21 / 16 |
+| 2 | 34 | 180/300 | 7.40 | 8.0 m | 101 | 32 / 32 | 27 / 20 |
+| 3 | 59 | 110/300 | 8.58 | 7.8 m | 123 | 27 / 21 | 28 / 19 |
+| **mean** | **54.3** | **140.0/300** | **8.69** | **7.97 m** | **125** | **31.0 / 27.7** | — |
+
+修复进攻方卡死后，当前组合：
+- 终端/本地防御半径 **300 m**；
+- 碰撞后 **0.8 s 免撞 + 0.8 s 击退保持**；
+- 最小碰撞伤害 **50**；
+- 防守方编制 **1.0 × 非 ARD 进攻方**，65% 拦截机。
+
+当前 3 seed 均值 **140/300**；之前单次跑到过 173/300，说明机器帧率/时序方差很大。
+1.2 编制能到 178/300，但 defender twitch 检测重新出现 1~2 次，因此没有保留；
+最小伤害 60、拦截机 0.8 也都没有提高基地，已回退。
+
+修复前卡死进攻方造成的 180/300 是虚高；当前 140/300 是在进攻方正常移动下的真实基线。
+
+> 判断改动看 `battle_bench.py` 的均值和 min/max；单 seed 和机器帧率方差都很大。
+
+---
+
+### 九、工具脚本 (`tools/`)
 
 | 脚本 | 用途 |
 |------|------|
+| `battle_trace.py` | 单机运动 + 攻防对应量化（SUMMARY/TRACE/COLLISION/DEATH） |
+| `battle_bench.py` | 多 seed 聚合基准（基地/碰撞/分配/切换均值） |
 | `cbs_perf_test.py` | 测试不同无人机数量下的 CBS 耗时与成功率 |
 | `map_grid_check.py` | 检查建筑重叠、网格占据情况 |
 
@@ -473,6 +613,12 @@ python main.py
 
 # 无头测试
 python remark/test.py --duration 10 --offensive-count 4 --defensive-count 4
+
+# 攻防对应量化（跟踪一架防守方 + 汇总）
+python tools/battle_trace.py --duration 25 --max-offensive 40 --spawn 0.8 --seed 1
+
+# 多 seed 聚合基准（推荐用均值判断改动是否有效）
+python tools/battle_bench.py --seeds 1,2,3 --duration 60
 
 # 网格检查
 python tools/map_grid_check.py

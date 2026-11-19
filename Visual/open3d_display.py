@@ -76,6 +76,7 @@ class Open3DDisplay:
             "offense":  2,
             "defense":  3,
             "status":   5,
+            "corr":     6,
             "hp":       7,
             "legend_off": 9,
             "legend_def": 10,
@@ -99,7 +100,6 @@ class Open3DDisplay:
         self.is_open = True
         self.paused = False
 
-        self.show_paths = False   # True=显示避障路径, False=不显示
         self.static_objects_added = False      # 静态物体是否已添加
         self.dynamic_geometries = set()        # 存储动态几何体的名称
         self.map_initialized = False           # 地图是否已初始化（用于首次更新时添加建筑）
@@ -132,44 +132,36 @@ class Open3DDisplay:
         }
 
         # Set up camera
-        bounds = self.o3d.geometry.AxisAlignedBoundingBox(
-            np.array([-1000, -1000, -100], dtype=np.float64),
-            np.array([1000, 1000, 100], dtype=np.float64),
-        )
-        center = np.array([0.0, 0.0, 0.0], dtype=np.float32)
-        self.scene_widget.setup_camera(45.0, bounds, center)
+        self._setup_default_camera()
         self.scene_widget.set_view_controls(self.gui.SceneWidget.Controls.ROTATE_CAMERA)
+
+    def _setup_default_camera(self):
+        """默认视角：覆盖地图范围和 z=-50~400m 的飞行空域。"""
+        half_x = max(1000.0, self.map_size[0] / 2.0)
+        half_y = max(1000.0, self.map_size[1] / 2.0)
+        bounds = self.o3d.geometry.AxisAlignedBoundingBox(
+            np.array([-half_x, -half_y, -50.0], dtype=np.float64),
+            np.array([half_x, half_y, 400.0], dtype=np.float64),
+        )
+        center = np.array([0.0, 0.0, 120.0], dtype=np.float32)
+        self.scene_widget.setup_camera(45.0, bounds, center)
 
     def _mouse_callback(self, event):
         if event.type == self.gui.MouseEvent.Type.BUTTON_DOWN and event.is_button_down(self.gui.MouseButton.RIGHT):
-            bounds = self.o3d.geometry.AxisAlignedBoundingBox(
-                np.array([-1000, -1000, -100], dtype=np.float64),
-                np.array([1000, 1000, 100], dtype=np.float64),
-            )
-            center = np.array([0.0, 0.0, 0.0], dtype=np.float32)
-            self.scene_widget.setup_camera(45.0, bounds, center)
+            self._setup_default_camera()
             return self.gui.SceneWidget.EventCallbackResult.CONSUMED
         return self.gui.SceneWidget.EventCallbackResult.IGNORED
 
     def _key_callback(self, event):
-        """键盘快捷键：R=重置视角 P=暂停 T=切换路径显示"""
+        """键盘快捷键：R=重置视角 P=暂停"""
         if event.type == self.gui.KeyEvent.Type.DOWN:
             key = event.key
             if key == ord('R') or key == ord('r'):
-                bounds = self.o3d.geometry.AxisAlignedBoundingBox(
-                    np.array([-1000, -1000, -100], dtype=np.float64),
-                    np.array([1000, 1000, 100], dtype=np.float64),
-                )
-                center = np.array([0.0, 0.0, 0.0], dtype=np.float32)
-                self.scene_widget.setup_camera(45.0, bounds, center)
+                self._setup_default_camera()
                 return self.gui.SceneWidget.EventCallbackResult.CONSUMED
             elif key == ord('P') or key == ord('p'):
                 self.paused = not self.paused
                 print(f"[HUD] Paused: {self.paused}")
-                return self.gui.SceneWidget.EventCallbackResult.CONSUMED
-            elif key == ord('T') or key == ord('t'):
-                self.show_paths = not self.show_paths
-                print(f"[HUD] Show paths: {self.show_paths}")
                 return self.gui.SceneWidget.EventCallbackResult.CONSUMED
         return self.gui.SceneWidget.EventCallbackResult.IGNORED
 
@@ -245,20 +237,33 @@ class Open3DDisplay:
             self.scene_widget.scene.add_geometry("city_buildings", combined, material)
             print(f"[Map] 显示随机建筑: {len(self.buildings)} 个立方体")
             
-    def _init_map_data(self):
+    def _init_map_data(self, config=None):
         if self.map_data_initialized:
             return
         if self.obj_model_path and os.path.exists(self.obj_model_path):
-            mesh, obs_grid, obs_height, cell_size, bounds = voxelize_obj(self.obj_model_path)
-            self.city_mesh = mesh
-            self.map_grid = MapGrid.from_arrays(obs_grid, obs_height, cell_size, bounds)
-            print(f"[Map] 使用 OBJ 模型体素化，网格 {obs_grid.shape}")
-        else:
-            from utils.map_loader import generate_buildings
-            self.buildings = generate_buildings()
-            self.map_grid = MapGrid(self.buildings, cell_size=5.0)
-            print("[Map] 使用随机生成建筑")
+            try:
+                print(f"[Map] 正在体素化 OBJ: {os.path.basename(self.obj_model_path)} ...")
+                mesh, obs_grid, obs_height, cell_size, bounds = voxelize_obj(self.obj_model_path)
+                self.city_mesh = mesh
+                self.map_grid = MapGrid.from_arrays(obs_grid, obs_height, cell_size, bounds)
+                print(f"[Map] OBJ 体素化完成，网格 {obs_grid.shape}")
+            except Exception as exc:
+                print(f"[Map] OBJ 体素化失败，改用随机建筑: {exc}")
+                self.obj_model_path = None
+                self.city_mesh = None
+        if self.map_grid is None:
+            map_cfg = (config or {}).get("map", {})
+            cell_size = float(map_cfg.get("path_cell_size", 5.0))
+            width, height = self.map_size
+            self.buildings = generate_buildings(config=config)
+            self.map_grid = MapGrid(
+                self.buildings,
+                bounds=(-width / 2.0, -height / 2.0, width / 2.0, height / 2.0),
+                cell_size=cell_size,
+            )
+            print(f"[Map] 使用随机生成建筑: {len(self.buildings)} 个, cell={cell_size}m")
         self.map_data_initialized = True
+        self.map_initialized = True
 
     def _on_layout(self, layout_context):
         r = self.window.content_rect
@@ -293,7 +298,7 @@ class Open3DDisplay:
         filled = max(0, min(width, int(round(pct / 100.0 * width))))
         return "[" + "#" * filled + "-" * (width - filled) + "]"
 
-    def _refresh_hud(self, drones: list, base_health: float) -> None:
+    def _refresh_hud(self, drones: list, base_health: float, metrics: dict | None = None) -> None:
         """每帧刷新所有 HUD 行标签的文本与颜色。"""
         active = [d for d in drones if not d.destroyed]
         tc = {t: sum(1 for d in active if d.drone_type == t) for t in self.drone_color_map}
@@ -335,6 +340,14 @@ class Open3DDisplay:
         labels["status"].text = status_text
         labels["status"].text_color = self._hud_dim
 
+        # 攻防对应指标（由 main 每帧传入）
+        metrics = metrics or {}
+        corr_text = (f"Visible: {int(metrics.get('visible', 0))}    "
+                     f"Assigned: {int(metrics.get('assigned', 0))}    "
+                     f"Collisions: {int(metrics.get('collisions', 0))}")
+        labels["corr"].text = corr_text
+        labels["corr"].text_color = self._hud_cyan
+
         # 血量条行
         bar = self._bar_ascii(base_health)
         hp_text = f"Base HP  {bar}  {base_health:5.1f}%"
@@ -355,7 +368,7 @@ class Open3DDisplay:
         labels["legend_def"].text_color = self._hud_dim
 
         # 控制行
-        ctrl_text = f"FPS: {fps_str}    Time: {time_str}    [R] Reset    [P] Pause    [T] Paths"
+        ctrl_text = f"FPS: {fps_str}    Time: {time_str}    [R] Reset    [P] Pause"
         labels["controls"].text = ctrl_text
         labels["controls"].text_color = self._hud_dim
 
@@ -383,7 +396,8 @@ class Open3DDisplay:
             print(f"[WARN] Skip geometry {name}: {exc}")
             return False
 
-    def update(self, drones: List[BaseDrone], detections, base_health: float, base_positions):
+    def update(self, drones: List[BaseDrone], detections, base_health: float,
+               base_positions, sim_time=None, metrics=None):
         if not self.is_open:
             return
 
@@ -582,11 +596,13 @@ class Open3DDisplay:
                 self._fps_frame_count = 0
                 self._fps_accum_time = 0.0
 
-        if self._fps_current > 0:
+        if sim_time is not None:
+            self._sim_elapsed = float(sim_time)
+        elif self._fps_current > 0:
             self._sim_elapsed += 1.0 / self._fps_current
         else:
             self._sim_elapsed += 0.016
-        self._refresh_hud(drones, base_health)
+        self._refresh_hud(drones, base_health, metrics)
 
         self.scene_widget.force_redraw()
         self.window.post_redraw()

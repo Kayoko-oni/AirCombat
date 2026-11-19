@@ -79,8 +79,16 @@ def build_assignment_config(config: Dict[str, Any]) -> ImprovedAuctionConfig:
 
 def build_map_grid(config: Dict[str, Any]) -> MapGrid:
     """Build obstacle map data in the same style as main simulation."""
+    map_cfg = config.get("map", {})
+    width = float(map_cfg.get("width", 1000))
+    height = float(map_cfg.get("height", 1000))
+    cell_size = float(map_cfg.get("path_cell_size", 5.0))
     buildings = generate_buildings(config=config)
-    return MapGrid(buildings, cell_size=5.0)
+    return MapGrid(
+        buildings,
+        bounds=(-width / 2.0, -height / 2.0, width / 2.0, height / 2.0),
+        cell_size=cell_size,
+    )
 
 
 def spawn_random_drone(config: Dict[str, Any], drones: List[Any], max_offensive: int = 80) -> None:
@@ -580,7 +588,7 @@ def run_evaluation(
             "enable_spawn": enable_spawn,
             "offensive_count": offensive_count,
             "defensive_count": defensive_count,
-            "map_grid_cell_size": 5.0,
+            "map_grid_cell_size": float(base_config.get("map", {}).get("path_cell_size", 5.0)),
             "cbs_eval_max_agents": cbs_eval_max_agents,
             "strategy_interval_frames": strategy_interval_frames,
             "pathplan_interval_frames": pathplan_interval_frames,

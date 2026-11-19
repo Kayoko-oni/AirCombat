@@ -1,3 +1,5 @@
+import math
+import time
 from typing import List, Tuple
 
 from drones.base_drone import BaseDrone
@@ -11,7 +13,8 @@ def is_offensive_type(drone_type: str) -> bool:
     return drone_type in _OFFENSIVE_TYPES
 
 
-def detect_collisions(drones: List[BaseDrone], min_distance: float = 8.0) -> List[Tuple[BaseDrone, BaseDrone]]:
+def detect_collisions(drones: List[BaseDrone], min_distance: float = 8.0,
+                      now: float | None = None) -> List[Tuple[BaseDrone, BaseDrone]]:
     """
     无人机碰撞检测
     参数:
@@ -38,11 +41,62 @@ def detect_collisions(drones: List[BaseDrone], min_distance: float = 8.0) -> Lis
 
 
 
-def resolve_collisions(collisions: List[Tuple[BaseDrone, BaseDrone]]) -> None:
+def _separate_pair(drone_a: BaseDrone, drone_b: BaseDrone, min_distance: float) -> None:
+    """把仍在碰撞阈值内的两机沿连线推开，避免下一帧继续触发同一对碰撞。"""
+    if not (drone_a.is_alive() or drone_b.is_alive()):
+        return
+    dx = drone_b.position[0] - drone_a.position[0]
+    dy = drone_b.position[1] - drone_a.position[1]
+    dz = drone_b.position[2] - drone_a.position[2]
+    dist = math.sqrt(dx * dx + dy * dy + dz * dz)
+    if dist < 1e-6:
+        ux, uy, uz = 1.0, 0.0, 0.0
+    else:
+        ux, uy, uz = dx / dist, dy / dist, dz / dist
+    overlap = max(0.0, float(min_distance) - dist)
+    if drone_a.is_alive() and drone_b.is_alive():
+        shift = overlap * 0.5 + 0.5
+        drone_a.position = [
+            drone_a.position[0] - ux * shift,
+            drone_a.position[1] - uy * shift,
+            drone_a.position[2] - uz * shift,
+        ]
+        drone_b.position = [
+            drone_b.position[0] + ux * shift,
+            drone_b.position[1] + uy * shift,
+            drone_b.position[2] + uz * shift,
+        ]
+    elif drone_a.is_alive():
+        shift = overlap + 0.5
+        drone_a.position = [
+            drone_a.position[0] - ux * shift,
+            drone_a.position[1] - uy * shift,
+            drone_a.position[2] - uz * shift,
+        ]
+    else:
+        shift = overlap + 0.5
+        drone_b.position = [
+            drone_b.position[0] + ux * shift,
+            drone_b.position[1] + uy * shift,
+            drone_b.position[2] + uz * shift,
+        ]
+
+
+def resolve_collisions(collisions: List[Tuple[BaseDrone, BaseDrone]],
+                       min_distance: float = 8.0, now: float | None = None) -> None:
     """处理发生碰撞的无人机对，计算相对速度, 计算碰撞后血量, 执行坠毁判断, 设置碰撞后速度方向"""
     for drone_a, drone_b in collisions:
+        # 免撞窗口内不再扣血/反向，但仍然把两机推开，避免叠在一起
+        immune = now is not None and (
+            getattr(drone_a, "_collision_immune_until", -1.0) > now
+            or getattr(drone_b, "_collision_immune_until", -1.0) > now
+        )
+        if immune:
+            _separate_pair(drone_a, drone_b, min_distance)
+            continue
+
         relative_speed = sum(abs(a - b) for a, b in zip(drone_a.velocity, drone_b.velocity))
-        damage = max(35.0, min(130.0, relative_speed * 3.0))
+        damage = max(50.0, min(130.0, relative_speed * 3.0))
         # 标记为碰撞造成的伤害，这样可视化在坠落阶段区分样式
         drone_a.death_cause = "collision"
         drone_b.death_cause = "collision"
@@ -52,6 +106,16 @@ def resolve_collisions(collisions: List[Tuple[BaseDrone, BaseDrone]]) -> None:
             drone_a.set_velocity([-v for v in drone_a.velocity])
         if drone_b.is_alive():
             drone_b.set_velocity([-v for v in drone_b.velocity])
+        if now is not None:
+            if drone_a.is_alive():
+                drone_a._collision_immune_until = float(now) + 0.8
+                drone_a._collision_knockback_until = time.time() + 0.8
+            if drone_b.is_alive():
+                drone_b._collision_immune_until = float(now) + 0.8
+                drone_b._collision_knockback_until = time.time() + 0.8
+
+        # 立即把两机分开到碰撞阈值之外，避免贴脸反复反向
+        _separate_pair(drone_a, drone_b, min_distance)
     
     #每次取出collisions列表中的一个元组, 将它们的作为循环变量drone_a和drone_b参与循环
     #   计算两架无人机的相对速度: 近似为 vxa+vya+vza-vxb-vyb-vzb, 做的是标量的计算, 可能需要讨论过后更改

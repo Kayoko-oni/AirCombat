@@ -14,6 +14,7 @@
 该类本身不控制无人机速度，仅决定下一步航点。
 """
 from typing import Optional, Tuple, List
+import math
 import time
 import yaml
 from pathlib import Path
@@ -71,6 +72,19 @@ class PathTracker:
     def _dist2d(self, a, b):
         return ((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2) ** 0.5
 
+    @staticmethod
+    def _climb_waypoint(pos, goal, climb_z):
+        """爬升时也给一个朝目标前进的水平分量，避免在边界/楼前只升降、看起来卡死。"""
+        dx = float(goal[0]) - float(pos[0])
+        dy = float(goal[1]) - float(pos[1])
+        d = math.hypot(dx, dy)
+        if d < 1e-6:
+            return [float(pos[0]), float(pos[1]), float(climb_z)]
+        step = min(20.0, d)
+        return [float(pos[0]) + dx / d * step,
+                float(pos[1]) + dy / d * step,
+                float(climb_z)]
+
     def update(self, goal_world: Tuple[float, float, float], map_grid) -> Optional[List[float]]:
         """更新并返回下一步航点（世界坐标）；None 表示目标直达，调用方应直接追踪目标。"""
         if map_grid is None or a_star_plan_world is None or line_of_sight_world is None:
@@ -86,7 +100,7 @@ class PathTracker:
                 self.climb_active = False
                 self.climb_target_z = None
             else:
-                return [float(pos[0]), float(pos[1]), float(self.climb_target_z)]
+                return self._climb_waypoint(pos, goal, float(self.climb_target_z))
 
         # 判断是否需要重规划（目标变化超过阈值或无目标）
         need_replan = False
@@ -160,7 +174,8 @@ class PathTracker:
                 self.climb_active = True
                 self.climb_target_z = climb_z
                 try:
-                    self.drone._avoid_path = [[float(pos[0]), float(pos[1]), float(pos[2])], [float(pos[0]), float(pos[1]), climb_z]]
+                    _wp = self._climb_waypoint(pos, goal, climb_z)
+                    self.drone._avoid_path = [[float(pos[0]), float(pos[1]), float(pos[2])], _wp]
                 except Exception:
                     pass
                 self.last_replan = now
@@ -173,13 +188,19 @@ class PathTracker:
         success = bool(plan)
         if success:
             if len(plan) <= 2:
-                climb_z = max(pos[2], 20.0)
-                # 直接提升高度并继续直追
+                # 短路径/退化路径：不要再返回“自身位置”（距离≈0 时调用方不会设速度，直接悬停）
                 self.goal = goal
                 self.last_replan = now
-                if self.debug_log:
-                    logger.debug("Path too short (len=%d), direct chase for %s", len(plan), self.drone.name)
-                return [pos[0], pos[1], climb_z]
+                try:
+                    self.drone._avoid_path = None
+                except Exception:
+                    pass
+                if pos[2] < 19.0:
+                    climb_z = 20.0
+                    self.climb_active = True
+                    self.climb_target_z = climb_z
+                    return self._climb_waypoint(pos, goal, climb_z)
+                return None
 
             self.path = plan
             self.idx = 1 if len(plan) > 1 else 0
@@ -189,8 +210,25 @@ class PathTracker:
                 self.drone._avoid_path = self.path
             except Exception:
                 pass
-            logger.info("Replan success: %s time=%.1fms len=%d", self.drone.name, elapsed_ms, len(plan))
+            if self.debug_log:
+                logger.info("Replan success: %s time=%.1fms len=%d",
+                            self.drone.name, elapsed_ms, len(plan))
+            else:
+                logger.debug("Replan success: %s time=%.1fms len=%d",
+                             self.drone.name, elapsed_ms, len(plan))
             return self.path[self.idx] if self.idx < len(self.path) else None
         else:
-            climb_z = max(pos[2], 20.0)
-            return [pos[0], pos[1], climb_z]
+            # 规划失败：同样不要返回自身位置，否则无人机会“卡死”在原地。
+            # 低空先爬升到 20 m，再退回直接追击；高空直接追击。
+            self.goal = goal
+            self.last_replan = now
+            try:
+                self.drone._avoid_path = None
+            except Exception:
+                pass
+            if pos[2] < 19.0:
+                climb_z = 20.0
+                self.climb_active = True
+                self.climb_target_z = climb_z
+                return self._climb_waypoint(pos, goal, climb_z)
+            return None

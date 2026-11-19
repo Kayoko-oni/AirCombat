@@ -2,6 +2,8 @@ map:
   width: 1000
   height: 1000
   center: [0, 0, 0]
+  path_cell_size: 5.0       # 规划网格分辨率（米）；改成 10 可减少相邻格过近的问题
+  use_obj_model: true       # 可视化时优先用 Data/maps 里的 OBJ 城市模型；false 用随机建筑
   buildings:
     # 建筑生成相关配置：支持配置生成数量区间、是否避免 XY 平面重叠、缓冲距离等
     count_min: 180
@@ -36,15 +38,32 @@ simulation:
   # 0 表示无限运行时间，直到手动关闭程序
   # TODO: 添加暂停/恢复控制和保存/加载状态
 
-  # 生成新进攻无人机的时间间隔（秒）- 调整为更快的生成速度
-  spawn_interval_min: 0.2   # 最小0.3秒生成一个
-  spawn_interval_max: 0.2   # 最大0.8秒生成一个
+  # 任务分配/CBS 的最小间隔（秒）。策略耗时会自动把实际间隔拉长，避免大编队掉帧
+  strategy_interval_s: 0.12
+
+  # 是否启用 Open3D 窗口；false 或无 open3d 时自动无界面运行
+  enable_visualization: true
+
+  # 轨迹线每帧都会重建，长时间运行会增加 Open3D 压力；默认关闭，需要时再开
+  enable_trails: false
+
+  # 所有存活无人机的最低离地高度（米），避免贴着地面飞
+  min_flight_altitude: 5.0
+
+  # 电池消耗速率（点/秒）。5.0 时 60 点电池只能飞 12 秒，攻防还没接触就坠毁；
+  # 演示/对抗评估用 0.5，电池寿命 120~240 秒。
+  battery_drain_rate: 0.5
+
+  # 生成新进攻无人机的时间间隔（秒）：0.8 表示每秒约 1.25 架
+  spawn_interval_min: 0.8
+  spawn_interval_max: 0.8
   
-  # 最大同时存在的进攻方数量 - 调高到100
-  max_offensive: 200
+  # 最大同时存在的进攻方数量（可视化演示规模；压力测试可自行调大）
+  max_offensive: 40
   
-  # 防守方自动平衡相关 - 增加到进攻方的1.2倍
-  defender_ratio: 1.2       # 防守方数量 = 进攻方 * 1.2
+  # 防守方自动平衡相关 - 与进攻方保持约 1:1
+  defender_ratio: 1.0       # 防守方数量 ≈ 进攻方 * ratio
+  defender_interceptor_ratio: 0.65  # 新补充防守方中拦截机占比（更耐撞）
   
   # 进攻方初始化高度分布（低空+高空）
   offensive_spawn_z_low_min: 5.0
@@ -69,6 +88,7 @@ path_planning:
   replan_cooldown: 2.0      # 秒，重规划的最小间隔
   max_plan_time_ms: 30     # 毫秒，单次 A* 规划的时间上限
   path_tolerance: 1.0       # 米，认为已到达路径点的容差
+  plan_speed: 30.0          # 米/秒，CBS 路径执行速度（全体防守方统一，保证时间表可比）
   debug_log: false          # 是否记录重规划日志到 stdout
   # 爬升避障相关（当地面路径被高楼阻挡时，先爬升再继续）
   climb_clearance: 5.0      # 米，爬升到障碍顶端之上所需最小安全距离
@@ -126,14 +146,14 @@ assignment:
 
 drones:
   attack:
-    speed: 7.5
-    max_speed: 30.0
+    speed: 8.0
+    max_speed: 32.0
     health: 80.0
     attack_power: 25.0
     battery: 80.0
   tank:
-    speed: 4.5
-    max_speed: 20.0
+    speed: 4.8
+    max_speed: 22.0
     health: 150.0
     attack_power: 15.0
     battery: 120.0
@@ -149,3 +169,18 @@ drones:
     health: 90.0
     attack_power: 20.0
     battery: 90.0
+  ew:
+    speed: 10.0
+    max_speed: 32.0
+    health: 40.0
+    attack_power: 15.0
+    battery: 100.0
+    jamming_radius: 200.0
+  anti_radiation:
+    speed: 12.0
+    max_speed: 32.0
+    health: 45.0
+    attack_power: 0.0
+    battery: 90.0
+    jamming_sector_half_angle_deg: 60.0
+    self_destruct_distance: 80.0

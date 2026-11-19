@@ -1,8 +1,6 @@
 #读取.obj文件，或用文件夹内随机生成地图的方法生成一个地图，是工具类函数
 
 import random
-import open3d as o3d
-import numpy as np
 import yaml
 from pathlib import Path
 from typing import List, Tuple
