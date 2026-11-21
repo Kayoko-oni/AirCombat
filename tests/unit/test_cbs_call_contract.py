@@ -25,21 +25,31 @@ class CbsAgentCapContractTest(unittest.TestCase):
         """截断值必须为正，否则不会规划任何 agent。"""
         self.assertGreater(main._CBS_MAX_AGENTS, 0)
 
-    def test_planner_rejects_oversized_batch(self) -> None:
-        """超过 max_agents 时应返回空列表，作为回归基线。"""
+    def test_planner_returns_padded_partial_for_oversized_batch(self) -> None:
+        """新 CBS 对超限 batch 返回对齐的部分解，尾部为空路径。"""
         class _FakeMapGrid:
             width = 10
             height = 10
+            cell_size = 1.0
 
             @staticmethod
             def is_grid_occupied(x: int, y: int) -> bool:
                 return False
 
+            @staticmethod
+            def world_to_grid(x: float, y: float):
+                return int(x), int(y)
+
+            @staticmethod
+            def grid_to_world(gx: int, gy: int):
+                return float(gx), float(gy)
+
         agents = [([0, 0], [5, 5]) for _ in range(main._CBS_MAX_AGENTS + 1)]
 
         result = cbs_plan_paths(agents, map_grid=_FakeMapGrid(), max_agents=main._CBS_MAX_AGENTS)
 
-        self.assertEqual(result, [])
+        self.assertEqual(len(result), len(agents))
+        self.assertEqual(result[-1], [])
 
 
 if __name__ == "__main__":

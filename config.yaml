@@ -2,6 +2,7 @@ map:
   width: 1000
   height: 1000
   center: [0, 0, 0]
+  path_cell_size: 5.0       # 规划网格分辨率（米）
   buildings:
     # 建筑生成相关配置：支持配置生成数量区间、是否避免 XY 平面重叠、缓冲距离等
     count_min: 180
@@ -18,6 +19,8 @@ base:
 simulation:
   fps: 30
   duration: 300
+  min_flight_altitude: 5.0   # 最低离地高度（米）
+  enable_trails: false       # 轨迹线每帧重建，长时间运行建议关闭
   # 0 表示无限运行时间，直到手动关闭程序
   # TODO: 添加暂停/恢复控制和保存/加载状态
 
@@ -46,6 +49,7 @@ path_planning:
   replan_cooldown: 0.5      # 秒，重规划的最小间隔
   max_plan_time_ms: 50     # 毫秒，单次 A* 规划的时间上限
   path_tolerance: 1.0       # 米，认为已到达路径点的容差
+  plan_speed: 30.0          # 米/秒，CBS 路径执行速度（全体防守方统一）
   debug_log: false          # 是否记录重规划日志到 stdout
   # 爬升避障相关（当地面路径被高楼阻挡时，先爬升再继续）
   climb_clearance: 5.0      # 米，爬升到障碍顶端之上所需最小安全距离

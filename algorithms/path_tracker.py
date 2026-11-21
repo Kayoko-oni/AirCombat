@@ -14,6 +14,7 @@
 该类本身不控制无人机速度，仅决定下一步航点。
 """
 from typing import Optional, Tuple, List
+import math
 import time
 import yaml
 from pathlib import Path
@@ -37,10 +38,18 @@ class PathTracker:
         self.last_replan = 0.0
         self.climb_active = False
         self.climb_target_z: Optional[float] = None
+        # 短时缓存：用于缓存最近一次的视线/最大高度判断，减少频繁调用昂贵的 map_grid 函数
+        self._los_cache = {
+            'pos': None,
+            'goal': None,
+            'maxh': 0.0,
+            'los': False,
+            'time': 0.0,
+        }
         # load defaults
         self.replan_distance = 1.0  # 米，目标变化超过此距离将触发重规划
-        self.replan_cooldown = 0.5  # 秒，最小重规划间隔
-        self.max_plan_time_ms = 50  # 毫秒
+        self.replan_cooldown = 2.0  # 秒，最小重规划间隔
+        self.max_plan_time_ms = 30  # 毫秒
         self.path_tolerance = 1.0   # 米，小于此认为到达路径点
         self.debug_log = False
         self.climb_clearance = 5.0  # 米，爬升时需高出障碍的安全高度
@@ -63,24 +72,92 @@ class PathTracker:
     def _dist2d(self, a, b):
         return ((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2) ** 0.5
 
+    @staticmethod
+    def _climb_waypoint(pos, goal, climb_z):
+        """爬升时也给一个朝目标前进的水平分量，避免在边界/楼前只升降、看起来卡死。"""
+        dx = float(goal[0]) - float(pos[0])
+        dy = float(goal[1]) - float(pos[1])
+        d = math.hypot(dx, dy)
+        if d < 1e-6:
+            return [float(pos[0]), float(pos[1]), float(climb_z)]
+        step = min(20.0, d)
+        return [float(pos[0]) + dx / d * step,
+                float(pos[1]) + dy / d * step,
+                float(climb_z)]
+
     def update(self, goal_world: Tuple[float, float, float], map_grid) -> Optional[List[float]]:
         """更新并返回下一步航点（世界坐标）；None 表示目标直达，调用方应直接追踪目标。"""
         if map_grid is None or a_star_plan_world is None or line_of_sight_world is None:
             return None
-
         now = time.time()
         goal = (float(goal_world[0]), float(goal_world[1]), float(goal_world[2] if len(goal_world) > 2 else 0.0))
         pos = tuple(self.drone.position[:3])
 
-        # 先检查沿线最高建筑高度：若双方已经在安全高度之上则认为可直达
+        # 如果正在爬升阶段，则优先继续爬升（这个分支很便宜）
+        if self.climb_active:
+            current_z = float(self.drone.position[2])
+            if abs(current_z - (self.climb_target_z or 0.0)) < 1.0:
+                self.climb_active = False
+                self.climb_target_z = None
+            else:
+                return self._climb_waypoint(pos, goal, float(self.climb_target_z))
+
+        # 判断是否需要重规划（目标变化超过阈值或无目标）
+        need_replan = False
+        if self.goal is None:
+            need_replan = True
+        else:
+            if self._dist2d(self.goal, goal) > self.replan_distance:
+                need_replan = True
+
+        # 如果已有路径且未超出容差，则尝试推进索引
+        if self.path is not None and not need_replan:
+            while self.idx < len(self.path) and self._dist2d(pos, self.path[self.idx]) < self.path_tolerance:
+                self.idx += 1
+            if self.idx >= len(self.path):
+                self.path = None
+                self.goal = None
+                return None
+            return self.path[self.idx]
+
+        # 限制重规划频率：如果在冷却时间内则直接使用旧路径（或退化为直接追击）
+        if now - self.last_replan < self.replan_cooldown:
+            if self.path is not None and self.idx < len(self.path):
+                return self.path[self.idx]
+            return None
+
+        # 下面进行视线检查与最多一次的昂贵高度查询，使用短时缓存减少重复计算
+        los = False
         maxh = 0.0
         try:
-            if hasattr(map_grid, "max_height_along_line"):
-                maxh = map_grid.max_height_along_line(pos, goal)
+            cache = self._los_cache
+            # 简单的网格化键（米级），对 pos/goal 做四舍五入以增加缓存命中
+            key_pos = (round(pos[0], 0), round(pos[1], 0), round(pos[2], 0))
+            key_goal = (round(goal[0], 0), round(goal[1], 0), round(goal[2], 0))
+            if cache['pos'] == key_pos and cache['goal'] == key_goal and (now - cache['time']) < 0.5:
+                los = cache['los']
+                maxh = cache['maxh']
+            else:
+                # 计算视线可达性（可能昂贵）
+                try:
+                    los = line_of_sight_world(pos, goal, map_grid)
+                except Exception:
+                    los = False
+                if hasattr(map_grid, "max_height_along_line"):
+                    try:
+                        maxh = map_grid.max_height_along_line(pos, goal)
+                    except Exception:
+                        maxh = 0.0
+                # 更新缓存
+                cache['pos'] = key_pos
+                cache['goal'] = key_goal
+                cache['los'] = los
+                cache['maxh'] = maxh
+                cache['time'] = now
         except Exception:
+            los = False
             maxh = 0.0
-
-        # 如果双方都在障碍之上并满足安全间隙，则认为视线可达
+        # 如果视线可达且高度安全，则直接追逐
         try:
             if pos[2] > maxh + self.climb_clearance and goal[2] > maxh + self.climb_clearance:
                 self.path = None
@@ -90,90 +167,68 @@ class PathTracker:
         except Exception:
             pass
 
-        # 如果正在爬升阶段，则优先继续爬升
-        if self.climb_active:
-            current_z = float(self.drone.position[2])
-            if abs(current_z - (self.climb_target_z or 0.0)) < 1.0:
-                # 已达到爬升高度，结束爬升阶段，下一次循环会重试直接或规划路径
-                self.climb_active = False
-                self.climb_target_z = None
-            else:
-                # 继续爬升：返回垂直上升目标点
-                return [float(pos[0]), float(pos[1]), float(self.climb_target_z)]
+        if not los:
+            # 若视线被阻挡且高度不足，则选择爬升避障并缓存该决定
+            if pos[2] <= maxh + self.climb_clearance:
+                climb_z = float(maxh + self.climb_clearance + 1.0)
+                self.climb_active = True
+                self.climb_target_z = climb_z
+                try:
+                    _wp = self._climb_waypoint(pos, goal, climb_z)
+                    self.drone._avoid_path = [[float(pos[0]), float(pos[1]), float(pos[2])], _wp]
+                except Exception:
+                    pass
+                self.last_replan = now
+                return [float(pos[0]), float(pos[1]), climb_z]
 
-        need_replan = False
-        if self.goal is None:
-            need_replan = True
-        else:
-            # 目标变化超过阈值
-            if self._dist2d(self.goal, goal) > self.replan_distance:
-                need_replan = True
-
-        # 如果已有路径且未超出容差，则尝试推进索引
-        if self.path is not None and not need_replan:
-            # 前进到下一个未到达点
-            while self.idx < len(self.path) and self._dist2d(pos, self.path[self.idx]) < self.path_tolerance:
-                self.idx += 1
-            if self.idx >= len(self.path):
-                # 已到达路径末尾
-                self.path = None
-                self.goal = None
-                return None
-            # 若路径仍有效，返回当前航点
-            return self.path[self.idx]
-
-        # 限制重规划频率
-        if now - self.last_replan < self.replan_cooldown:
-            # 如果有旧路径可用，继续使用，否则直接返回 None（直追）
-            if self.path is not None and self.idx < len(self.path):
-                return self.path[self.idx]
-            return None
-
-        # 如果视线被阻挡且高度不足，尝试触发爬升避障（简单处理）
-        try:
-            los = False
-            try:
-                los = line_of_sight_world(pos, goal, map_grid)
-            except Exception:
-                los = False
-
-            if not los:
-                maxh = 0.0
-                if hasattr(map_grid, "max_height_along_line"):
-                    maxh = map_grid.max_height_along_line(pos, goal)
-                # 如果当前高度低于障碍顶端 + 安全间隙，则先爬升
-                if pos[2] <= maxh + self.climb_clearance:
-                    climb_z = float(maxh + self.climb_clearance + 1.0)
-                    self.climb_active = True
-                    self.climb_target_z = climb_z
-                    try:
-                        self.drone._avoid_path = [[float(pos[0]), float(pos[1]), float(pos[2])], [float(pos[0]), float(pos[1]), climb_z]]
-                    except Exception:
-                        pass
-                    self.last_replan = now
-                    return [float(pos[0]), float(pos[1]), climb_z]
-        except Exception:
-            # 任何异常都不应阻塞正常逻辑
-            pass
-
-        # 执行 A* 规划
+        # 执行 A* 规划（受限时长）
         t0 = time.time()
         plan = a_star_plan_world(pos, goal, map_grid, max_time_ms=self.max_plan_time_ms)
         elapsed_ms = (time.time() - t0) * 1000.0
         success = bool(plan)
         if success:
+            if len(plan) <= 2:
+                # 短路径/退化路径：不要再返回“自身位置”（距离≈0 时调用方不会设速度，直接悬停）
+                self.goal = goal
+                self.last_replan = now
+                try:
+                    self.drone._avoid_path = None
+                except Exception:
+                    pass
+                if pos[2] < 19.0:
+                    climb_z = 20.0
+                    self.climb_active = True
+                    self.climb_target_z = climb_z
+                    return self._climb_waypoint(pos, goal, climb_z)
+                return None
+
             self.path = plan
             self.idx = 1 if len(plan) > 1 else 0
             self.goal = goal
             self.last_replan = now
-            # 将路径缓存到无人机对象，便于可视化/调试
             try:
                 self.drone._avoid_path = self.path
             except Exception:
                 pass
-            logger.info("Replan success: drone=%s time=%.1fms path_len=%d", getattr(self.drone, "name", "?"), elapsed_ms, len(plan))
+            if self.debug_log:
+                logger.info("Replan success: %s time=%.1fms len=%d",
+                            self.drone.name, elapsed_ms, len(plan))
+            else:
+                logger.debug("Replan success: %s time=%.1fms len=%d",
+                             self.drone.name, elapsed_ms, len(plan))
             return self.path[self.idx] if self.idx < len(self.path) else None
         else:
+            # 规划失败：同样不要返回自身位置，否则无人机会“卡死”在原地。
+            # 低空先爬升到 20 m，再退回直接追击；高空直接追击。
+            self.goal = goal
             self.last_replan = now
-            logger.info("Replan failed: drone=%s time=%.1fms", getattr(self.drone, "name", "?"), elapsed_ms)
+            try:
+                self.drone._avoid_path = None
+            except Exception:
+                pass
+            if pos[2] < 19.0:
+                climb_z = 20.0
+                self.climb_active = True
+                self.climb_target_z = climb_z
+                return self._climb_waypoint(pos, goal, climb_z)
             return None

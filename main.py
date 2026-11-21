@@ -21,7 +21,7 @@ from drones.factory import (
     create_anti_radiation_drone, create_ew_drone, create_anti_ew_drone,
     create_interceptor_drone, create_scout_drone,
 )
-from Controller.single_control import chase_target, chase_point, move_drone
+from Controller.single_control import chase_target, chase_point, move_drone, PathFollower
 from utils.logger import get_logger
 from base.base_manager import BaseManager
 
@@ -188,7 +188,8 @@ _LAST_ANTI_EW_SPAWN_TIME = 0.0
 _ANTI_EW_SPAWN_COOLDOWN = 0.5   # 冷却时间（秒）
 _MAX_ANTI_EW_RATIO = 1.5        # AntiEW 数量 / EW 数量 的上限
 
-def _spawn_anti_ew_if_needed(config: dict, drones: list, base_position: list):
+def _spawn_anti_ew_if_needed(config: dict, drones: list, base_position: list,
+                             map_grid=None):
     global _LAST_ANTI_EW_SPAWN_TIME
     import time
     now = time.time()
@@ -209,10 +210,28 @@ def _spawn_anti_ew_if_needed(config: dict, drones: list, base_position: list):
         return
     # 每次最多生成 2 架，加快响应 EW 威胁
     needed = min(needed, 2)
+
+    def _anti_ew_position():
+        if map_grid is not None:
+            for _ in range(24):
+                angle = random.uniform(0.0, 2.0 * math.pi)
+                radius = random.uniform(15.0, 60.0)
+                x = float(base_position[0]) + radius * math.cos(angle)
+                y = float(base_position[1]) + radius * math.sin(angle)
+                if not map_grid.is_occupied(x, y):
+                    return [x, y, 50.0]
+            for _ in range(160):
+                gx = random.randrange(map_grid.width)
+                gy = random.randrange(map_grid.height)
+                if not map_grid.is_grid_occupied(gx, gy):
+                    x, y = map_grid.grid_to_world(gx, gy)
+                    return [float(x), float(y), 50.0]
+        return [float(base_position[0]), float(base_position[1]), 50.0]
+
     for _ in range(needed):
         name = _make_drone_name("AntiEW")
-        create_anti_ew_drone(name, [base_position[0], base_position[1], 50.0], config, drones)
-        LOGGER.info("Spawned AntiEW drone: %s at base", name)
+        create_anti_ew_drone(name, _anti_ew_position(), config, drones)
+        LOGGER.info("Spawned AntiEW drone: %s near base", name)
     _LAST_ANTI_EW_SPAWN_TIME = now
 
 def _check_anti_ew_disruption(ew_drones: list, anti_ew_drones: list) -> None:
@@ -449,7 +468,8 @@ def _assignment_needs_refresh(
     return False
 
 
-def update_chase_strategy(drones, offensive_target_point, assignment_cfg=None, map_grid=None, base_position=None):
+def update_chase_strategy(drones, offensive_target_point, assignment_cfg=None, map_grid=None,
+                          base_position=None, sim_time=None, plan_speed=30.0):
     """输入一个无人机实例列表, 让防守方追击根据任务分配得到的目标进攻方, 进攻方追击传入的offensive_target_point
 
     参数说明：
@@ -461,6 +481,17 @@ def update_chase_strategy(drones, offensive_target_point, assignment_cfg=None, m
 
     兼容性：当 map_grid 为 None 时，退化为原有的直接追逐逻辑。
     """
+    current_time = sim_time if sim_time is not None else time.perf_counter()
+    if not hasattr(update_chase_strategy, "_last_cbs_time"):
+        update_chase_strategy._last_cbs_time = -1e9
+        update_chase_strategy._last_cbs_paths = None
+        update_chase_strategy._last_cbs_signature = None
+    if current_time < update_chase_strategy._last_cbs_time:
+        update_chase_strategy._last_cbs_time = -1e9
+        update_chase_strategy._last_cbs_paths = None
+        update_chase_strategy._last_cbs_signature = None
+    CBS_REPLAN_INTERVAL = 1.0
+
     if base_position is None:
         base_position = [0.0, 0.0, 0.0]
 
@@ -654,41 +685,64 @@ def update_chase_strategy(drones, offensive_target_point, assignment_cfg=None, m
                     pass
                 defender.set_velocity([0.0, 0.0, 0.0])
 
-        world_paths = []
-        if map_grid is not None and pairs and _cbs_plan_allowed():
-            try:
-                from algorithms.cbs_pathplan import cbs_plan_paths
-                # 只对前 _CBS_MAX_AGENTS 对做协同规划，其余由下方补尾逻辑走直线追逐。
-                plan_pairs = pairs[:_CBS_MAX_AGENTS]
-                plan_inputs = [(p[0], p[1]) for p in plan_pairs]
-                world_paths = cbs_plan_paths(
-                    plan_inputs,
-                    map_grid=map_grid,
-                    max_agents=_CBS_MAX_AGENTS,
-                    time_limit_ms=_CBS_TIME_LIMIT_MS,
-                )
-            except Exception:
-                world_paths = []
-            _note_cbs_result(bool(world_paths))
+        if map_grid is not None and pairs:
+            signature = tuple(
+                (d.name, getattr(getattr(d, "_assigned_target", None), "name", None))
+                for d in defenders_order
+            )
+            plans = getattr(update_chase_strategy, "_last_cbs_paths", None)
+            need_replan = (
+                plans is None
+                or (current_time - update_chase_strategy._last_cbs_time) >= CBS_REPLAN_INTERVAL
+                or signature != update_chase_strategy._last_cbs_signature
+            )
+            paths_updated = False
+            if need_replan and _cbs_plan_allowed():
+                try:
+                    from algorithms.cbs_pathplan import cbs_plan_schedules
+                    plan_pairs = pairs[:_CBS_MAX_AGENTS]
+                    plan_inputs = [(p[0], p[1]) for p in plan_pairs]
+                    tick_seconds = (float(map_grid.cell_size) / plan_speed
+                                    if plan_speed > 0 else 0.5)
+                    plans = cbs_plan_schedules(
+                        plan_inputs,
+                        map_grid=map_grid,
+                        max_agents=_CBS_MAX_AGENTS,
+                        time_limit_ms=_CBS_TIME_LIMIT_MS,
+                        tick_seconds=tick_seconds,
+                    )
+                except Exception:
+                    plans = []
+                _note_cbs_result(bool(plans))
+                update_chase_strategy._last_cbs_time = current_time
+                update_chase_strategy._last_cbs_paths = plans
+                update_chase_strategy._last_cbs_signature = signature
+                paths_updated = True
 
-            if world_paths:
-                for defender, path in zip(defenders_order, world_paths):
-                    if path and len(path) >= 2:
-                        next_wp = path[1]
-                        chase_point(defender, next_wp)
-                        try:
-                            defender._cbs_path = path
-                            defender._cbs_goal = path[-1]
-                        except Exception:
-                            pass
-                    elif path and len(path) == 1:
-                        chase_point(defender, path[0])
-                    else:
-                        target_obj = assignment.get(defender.name)
+            if plans:
+                for defender, plan in zip(defenders_order, plans):
+                    target_obj = assignment.get(defender.name)
+                    if not plan:
+                        defender._path_follower = None
                         if target_obj is not None:
                             chase_target(defender, target_obj)
-                # 超出 CBS 覆盖范围的防守方必须显式回退，否则会静止不动。
-                for defender in defenders_order[len(world_paths):]:
+                        continue
+                    points, times = plan
+                    follower = getattr(defender, "_path_follower", None)
+                    if paths_updated:
+                        if follower is None:
+                            follower = PathFollower(defender, plan_speed=plan_speed)
+                            defender._path_follower = follower
+                        follower.set_path(points, current_time, times=times)
+                        try:
+                            defender._cbs_path = points
+                            defender._cbs_goal = points[-1]
+                        except Exception:
+                            pass
+                    elif follower is None and target_obj is not None:
+                        chase_target(defender, target_obj)
+                # 超出 CBS 覆盖范围的防守方走直接追逐
+                for defender in defenders_order[len(plans):]:
                     target_obj = assignment.get(defender.name)
                     if target_obj is not None:
                         chase_target(defender, target_obj)
@@ -699,6 +753,7 @@ def update_chase_strategy(drones, offensive_target_point, assignment_cfg=None, m
                     defender = name_to_defender.get(def_name)
                     if defender is None:
                         continue
+                    defender._path_follower = None
                     if target is not None:
                         chase_target(defender, target)
                     else:
@@ -708,6 +763,7 @@ def update_chase_strategy(drones, offensive_target_point, assignment_cfg=None, m
                 defender = name_to_defender.get(def_name)
                 if defender is None:
                     continue
+                defender._path_follower = None
                 if target is not None:
                     chase_target(defender, target)
                 else:
@@ -725,9 +781,28 @@ def update_chase_strategy(drones, offensive_target_point, assignment_cfg=None, m
     )
 
 
+def update_path_followers(drones, sim_time):
+    """每帧推进 CBS 路径；路径走完后回退到当前分配目标/悬停。"""
+    for drone in drones:
+        follower = getattr(drone, "_path_follower", None)
+        if follower is None:
+            continue
+        if getattr(drone, "_assigned_target", None) is None:
+            drone._path_follower = None
+            continue
+        if follower.update(sim_time):
+            continue
+        target = getattr(drone, "_assigned_target", None)
+        if target is not None and target.is_alive():
+            chase_target(drone, target)
+        else:
+            drone.set_velocity([0.0, 0.0, 0.0])
+
+
 #=================暂行无人机生成策略，之后要被任务分配算法替代============================================
 
-def spawn_random_drone(config: dict, drones: list, base_position: list = None) -> None:
+def spawn_random_drone(config: dict, drones: list, base_position: list = None,
+                       map_grid=None) -> None:
     """批量生成进攻方无人机（每次 2~4 架），快速达到 max_offensive 上限。
 
     - AttackDrone/TankDrone 在存在屏蔽扇区时偏向扇区方向生成
@@ -751,17 +826,25 @@ def spawn_random_drone(config: dict, drones: list, base_position: list = None) -
     ew_prob = float(config.get("simulation", {}).get("ew_spawn_prob", 0.10))
 
     def _random_border_position():
-        """在地图边界随机生成一个位置"""
+        """在地图边界内部随机生成一个位置（±460~490，避免出生在地图外）。"""
         z = random.uniform(100.0, 250.0)
+        low, high, side = 460.0, 490.0, 480.0
         direction = random.choice(['top', 'bottom', 'left', 'right'])
         if direction == 'top':
-            return [random.uniform(-500, 500), random.uniform(520, 550), z]
+            x, y = random.uniform(-side, side), random.uniform(low, high)
         elif direction == 'bottom':
-            return [random.uniform(-500, 500), random.uniform(-550, -520), z]
+            x, y = random.uniform(-side, side), random.uniform(-high, -low)
         elif direction == 'left':
-            return [random.uniform(-550, -520), random.uniform(-500, 500), z]
+            x, y = random.uniform(-high, -low), random.uniform(-side, side)
         else:
-            return [random.uniform(520, 550), random.uniform(-500, 500), z]
+            x, y = random.uniform(low, high), random.uniform(-side, side)
+        if map_grid is not None:
+            try:
+                roof = float(map_grid.get_max_height_at_world(x, y))
+                z = max(z, roof + 10.0)
+            except Exception:
+                pass
+        return [x, y, min(350.0, z)]
 
     def _spawn_single():
         """生成单架无人机（内部辅助）"""
@@ -786,7 +869,15 @@ def spawn_random_drone(config: dict, drones: list, base_position: list = None) -
                     z = random.uniform(100.0, 250.0)
                     x = base_position[0] + dist * math.cos(angle)
                     y = base_position[1] + dist * math.sin(angle)
-                    position = [x, y, z]
+                    x = max(-480.0, min(480.0, x))
+                    y = max(-480.0, min(480.0, y))
+                    if map_grid is not None:
+                        try:
+                            roof = float(map_grid.get_max_height_at_world(x, y))
+                            z = max(z, roof + 10.0)
+                        except Exception:
+                            pass
+                    position = [x, y, min(350.0, z)]
                     name = _make_drone_name(drone_type.capitalize())
                     if drone_type == "attack":
                         create_attack_drone(name, position, config, drones)
@@ -803,31 +894,60 @@ def spawn_random_drone(config: dict, drones: list, base_position: list = None) -
     for _ in range(burst_count):
         _spawn_single()
 
-def balance_defenders(config: dict, drones: list) -> None:
-    """基于未匹配攻击方数量补充防守方。
-
-    只统计可用防守方（未被 EW 干扰、非 AntiEW），与可见进攻方数量对比。
-    """
+def balance_defenders(config: dict, drones: list, base_positions: list | None = None,
+                      map_grid=None) -> None:
+    """基于进攻方数量补充防守方；新防守方从基地附近空地起飞，不再堆在原点。"""
     offensive = [d for d in drones if _is_offensive(d) and d.is_alive()]
-    # 可用防守方：存活、未被干扰(或被干扰但属于拦截机)、非 AntiEW（AntiEW 不参与常规分配）
     from drones.defensive.anti_ew_drone import AntiEWDrone
-    from drones.defensive.interceptor_drone import InterceptorDrone
 
-    available_defenders = [
+    defenders_alive = [
         d for d in drones
         if not _is_offensive(d)
         and d.is_alive()
         and not isinstance(d, AntiEWDrone)
-        and (not getattr(d, '_ew_jammed', False) or isinstance(d, InterceptorDrone))
     ]
-    # 需要匹配的攻击方数量 = 可见进攻方（排除 ARD，它在自我毁灭路径上）
-    target_count = len([a for a in offensive if not isinstance(a, AntiRadiationDrone)])
-    need = max(0, target_count - len(available_defenders))
+    ratio = float(config.get("simulation", {}).get("defender_ratio", 1.0))
+    target_count = int(
+        len([a for a in offensive if not isinstance(a, AntiRadiationDrone)]) * ratio
+    )
+    need = max(0, target_count - len(defenders_alive))
     if need <= 0:
         return
+
+    fallback_base = config.get("base", {}).get("position", [0.0, 0.0, 0.0])
+    bases = base_positions or [fallback_base]
+    interceptor_ratio = float(
+        config.get("simulation", {}).get("defender_interceptor_ratio", 0.5)
+    )
+
+    def _free_spawn(base) -> list:
+        if map_grid is not None:
+            for _ in range(24):
+                angle = random.uniform(0.0, 2.0 * math.pi)
+                radius = random.uniform(15.0, 45.0)
+                x = float(base[0]) + radius * math.cos(angle)
+                y = float(base[1]) + radius * math.sin(angle)
+                if not map_grid.is_occupied(x, y):
+                    return [x, y, random.uniform(30.0, 80.0)]
+            bgx, bgy = map_grid.world_to_grid(base[0], base[1])
+            for _ in range(160):
+                gx = bgx + random.randint(-15, 15)
+                gy = bgy + random.randint(-15, 15)
+                if not map_grid.is_grid_occupied(gx, gy):
+                    x, y = map_grid.grid_to_world(gx, gy)
+                    return [float(x), float(y), random.uniform(30.0, 80.0)]
+            for _ in range(300):
+                gx = random.randrange(map_grid.width)
+                gy = random.randrange(map_grid.height)
+                if not map_grid.is_grid_occupied(gx, gy):
+                    x, y = map_grid.grid_to_world(gx, gy)
+                    return [float(x), float(y), random.uniform(30.0, 80.0)]
+        return [float(base[0]), float(base[1]), random.uniform(30.0, 80.0)]
+
     for _ in range(need):
-        drone_type = random.choice(["scout", "interceptor"])
-        position = [0.0, 0.0, 0.0]
+        base = random.choice(bases)
+        drone_type = "interceptor" if random.random() < interceptor_ratio else "scout"
+        position = _free_spawn(base)
         name = _make_drone_name(drone_type.capitalize())
         if drone_type == "scout":
             create_scout_drone(name, position, config, drones)
@@ -965,6 +1085,10 @@ def run_simulation(config: dict):
     """运行仿真主循环"""
     _reset_drone_name_seq()
     _reset_assignment_throttle()
+    _reset_cbs_throttle()
+    update_chase_strategy._last_cbs_time = -1e9
+    update_chase_strategy._last_cbs_paths = None
+    update_chase_strategy._last_cbs_signature = None
     global _ASSIGNMENT_CONFIG
     _ASSIGNMENT_CONFIG = _build_assignment_config(config)
     sim_cfg = config.get("simulation", {})
@@ -982,14 +1106,15 @@ def run_simulation(config: dict):
     #创建基地管理器实例, 从配置中读取基地的相关参数
     # 雷达传感器已移除，仿真不再执行探测扫描
     display = None
+    enable_trails = bool(sim_cfg.get("enable_trails", False))
     if Open3DDisplay is not None:
         try:
             obj_model_path = str(Path(__file__).resolve().parent / "Data" / "maps" / "3d66.com_JJI54558918189.obj")
             if os.path.exists(obj_model_path):
                 display = Open3DDisplay(map_size=(config["map"]["width"], config["map"]["height"]),
-                                        obj_model_path=obj_model_path, enable_trails=True, enable_dashed_lines=True)
+                                        obj_model_path=obj_model_path, enable_trails=enable_trails, enable_dashed_lines=True)
             else:
-                display = Open3DDisplay(map_size=(config["map"]["width"], config["map"]["height"]), enable_trails=True, enable_dashed_lines=True)
+                display = Open3DDisplay(map_size=(config["map"]["width"], config["map"]["height"]), enable_trails=enable_trails, enable_dashed_lines=True)
             display.open_window()
             display._init_map_data()
         except Exception as exc:
@@ -1000,6 +1125,8 @@ def run_simulation(config: dict):
     frame_time = 1.0 / fps
     start_time = time.time()
     duration = config["simulation"]["duration"]
+    plan_speed = float(config.get("path_planning", {}).get("plan_speed", 30.0))
+    min_flight_altitude = float(config.get("simulation", {}).get("min_flight_altitude", 5.0))
     # 生成间隔支持从配置读取，便于做小规模仿真
     spawn_min = config.get("simulation", {}).get("spawn_interval_min", 1.0)
     spawn_max = config.get("simulation", {}).get("spawn_interval_max", 3.0)
@@ -1074,15 +1201,26 @@ def run_simulation(config: dict):
                 _ASSIGNMENT_CONFIG,
                 map_grid=(display.map_grid if display is not None else None),
                 base_position=base_position,
+                sim_time=sim_elapsed,
+                plan_speed=plan_speed,
             ) #进攻方的目标点暂时设定为基地位置
+            update_path_followers(alive_drones, sim_elapsed)
 
             #6.5 检测 EW 无人机，生成 AntiEW 应对
-            _spawn_anti_ew_if_needed(config, alive_drones, base_position)
+            _spawn_anti_ew_if_needed(
+                config, alive_drones, base_position,
+                map_grid=(display.map_grid if display is not None else None),
+            )
             # 更新每架无人机的追逐策略 """
 
             #7. 更新存活无人机的位置
             for drone in alive_drones:
-                move_drone(drone, frame_time)
+                move_drone(
+                    drone,
+                    frame_time,
+                    map_grid=(display.map_grid if display is not None else None),
+                    min_altitude=min_flight_altitude,
+                )
             #对在alive_drone列表中(也就是确认存活的)无人机, 执行位置更新操作"""
 
             #8. 基地碰撞检测
@@ -1095,23 +1233,40 @@ def run_simulation(config: dict):
             if spawn_timer >= next_spawn_time:
                 spawn_timer = 0.0
                 next_spawn_time = random.uniform(spawn_min, spawn_max)
-                spawn_random_drone(config, drones, base_position)
+                spawn_random_drone(
+                    config, drones, base_position,
+                    map_grid=(display.map_grid if display is not None else None),
+                )
 
             #10. 平衡防守方数量
-            balance_defenders(config, drones) #每帧立即平衡防守方数量, 直到防守方数量 >= 进攻方数量"""
+            balance_defenders(
+                config, drones,
+                base_positions=[base_position],
+                map_grid=(display.map_grid if display is not None else None),
+            )
 
             detections = []
             #雷达模块已移除，进攻方目标全局可知
             LOGGER.debug("Detected %d objects", len(detections))
             if display is not None:
-                display.update(drones, detections, base_manager.get_health(), base_position)
-                if not display.is_open:
-                    LOGGER.info("Visualization window closed, ending simulation.")
-                    break
-                # Run GUI event loop tick
-                if not display.app.run_one_tick():
-                    LOGGER.info("GUI event loop ended.")
-                    break
+                try:
+                    display.update(drones, detections, base_manager.get_health(), base_position)
+                    if not display.is_open:
+                        LOGGER.info("Visualization window closed, ending simulation.")
+                        break
+                    # Run GUI event loop tick
+                    if not display.app.run_one_tick():
+                        LOGGER.info("GUI event loop ended.")
+                        break
+                except Exception:
+                    LOGGER.exception("Display update failed; switching to headless")
+                    try:
+                        display.close_window()
+                    except Exception:
+                        pass
+                    display = None
+                    time.sleep(frame_time)
+                    continue
             elapsed = time.perf_counter() - frame_start
             if elapsed < frame_time:
                 time.sleep(frame_time - elapsed)
